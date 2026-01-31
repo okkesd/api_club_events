@@ -150,7 +150,20 @@ class ClubUpdate(BaseModel):
     class Config:
         from_attributes = True
 
-
+# club status update by admin (chaning is_verified and rejection_reason)
 class ClubStatusUpdate(BaseModel):
     is_verified: bool
     rejection_reason: Optional[str] = None
+
+# event update by club owner (changing event infos as they wish)
+class EventUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    date: Optional[str] = None      # "YYYY-MM-DD"
+    start_time: Optional[str] = None # "10:00"
+    end_time: Optional[str] = None   # "12:00"
+    duration: Optional[float] = None
+    location_type: Optional[str] = None
+    location: Optional[str] = None
+    cover_image: Optional[str] = None
+    # Add other fields like capacity or registration link if needed

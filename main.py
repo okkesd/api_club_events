@@ -1,5 +1,6 @@
 import uuid
 import os
+from dotenv import load_dotenv
 import shutil
 import uvicorn
 import fastapi
@@ -18,16 +19,18 @@ from datetime import datetime
 
 from data import club_data, event_data
 from custom_types import *
-from app import database, models, schemas, utils
+import database, models, schemas, utils
 
 models.Base.metadata.create_all(bind=database.engine)
+
+load_dotenv()
 
 #create api
 api = FastAPI()
 
 # middlewares
 origins = [
-    "http://localhost:3000"
+    os.getenv("FRONTEND_URL", "http://localhost:3000"),
 ]
 
 api.add_middleware(
@@ -345,6 +348,7 @@ async def login_for_access_token(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+# posting an event (IMPORTANT NOTE: when an event is created (with mock up auth), it doesnt show up as expected in calendar, maybe its about auth or admin)
 @api.post("/events", response_model=schemas.CreateEventResponse)
 async def create_event(
     event_in: schemas.EventCreate, 
@@ -423,6 +427,7 @@ async def create_event(
         print(f"Error creating event: {e}")
         raise HTTPException(status_code=500, detail="Could not create event")
 
+# get all clubs for the admin page and club list
 @api.get("/all_clubs", response_model=schemas.AllClubs)
 async def get_all_clubs(db: Session = Depends(database.get_db)):
 
@@ -458,7 +463,7 @@ async def get_all_clubs(db: Session = Depends(database.get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting all clubs: {e}")
 
-
+# club update (profile update) by admin or club owner
 @api.patch("/clubs/{club_id}", response_model=schemas.ClubResponse)
 async def update_club(
     club_id: str, 
@@ -520,7 +525,7 @@ async def update_club(
         )
     )
 
-
+# get all clubs for admin
 @api.get("/admin/clubs", response_model=List[schemas.ClubData])
 async def get_all_clubs_admin(
     status: Optional[str] = None, # Optional filter: 'verified', 'pending'
@@ -561,6 +566,7 @@ async def get_all_clubs_admin(
     return clubs_to_return
 
 
+# change club's status with admin user
 @api.patch("/admin/clubs/{club_id}/status", response_model=schemas.ClubResponse)
 async def set_club_verification(
     club_id: str,
@@ -609,5 +615,82 @@ async def set_club_verification(
     return schemas.ClubResponse(success=True, data=club_to_return)
 
 
+@api.patch("/events/{event_id}", response_model=schemas.EventDataComplex)
+async def update_event(
+    event_id: str,
+    event_update: schemas.EventUpdate,
+    db: Session = Depends(database.get_db)
+):
+    # 1. Find Event
+    db_event = db.query(models.Event).filter(models.Event.id == event_id).first()
+    if not db_event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # 2. Get the Club (Owner)
+    club = db.query(models.User).filter(models.User.id == db_event.club_id).first()
+
+    # 3. PERMISSION CHECK (Mock Auth - in real app, use Depends(get_current_user))
+    # We assume the Frontend sends the request. 
+    # In a real app, you MUST compare current_user.id with db_event.club_id here.
+    # For now, we rely on the frontend check + validation logic below.
+    if not club:
+        return HTTPException(status_code=500, detail="Error occured in update event.")
+    
+    if not bool(club.is_verified) and str(club.role) != "admin":
+         raise HTTPException(status_code=403, detail="Unverified clubs cannot edit events.")
+
+    # 4. Update Fields
+    # Only update what is sent
+    if event_update.title is not None: db_event.title = event_update.title # type: ignore
+    if event_update.description is not None: db_event.description = event_update.description # type: ignore
+    if event_update.location is not None: db_event.location = event_update.location # type: ignore
+    if event_update.location_type is not None: db_event.location_type = event_update.location_type # type: ignore
+    if event_update.cover_image is not None: db_event.cover_image = event_update.cover_image # type: ignore
+    
+    # Time Logic Updates
+    if event_update.date is not None:
+         db_event.date = datetime.strptime(event_update.date, "%Y-%m-%d").date() # type: ignore
+    
+    if event_update.start_time is not None: db_event.start_time = event_update.start_time # type: ignore
+    if event_update.end_time is not None: db_event.end_time = event_update.end_time # type: ignore
+    if event_update.duration is not None: db_event.duration = event_update.duration
+
+    try:
+        db.commit()
+        db.refresh(db_event)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to update event")
+
+    # 5. Return (Map to Schema)
+    return schemas.EventDataComplex(
+        id=str(db_event.id),
+        title=str(db_event.title),
+        description=str(db_event.description),
+        clubID=str(db_event.club_id),
+        clubName=club.club_name,
+        date=str(db_event.date),
+        startTime=str(db_event.start_time),
+        endTime=str(db_event.end_time),
+        duration=db_event.duration,
+        locationType=str(db_event.location_type),
+        location=str(db_event.location),
+        coverImage=str(db_event.cover_image),
+        tags=[], 
+
+        # IMPORTANT NOTE: why these are directly setted ????
+        isRegistrationOpen=False, registrationLink=None, capacity=None
+        
+    )
+
 if __name__ == "__main__":
-    uvicorn.run("main:api", host="0.0.0.0", port=4444, reload=True)
+
+    port = int(os.getenv("BACKEND_PORT", 4444))
+    environment = os.getenv("ENVIRONMENT", "development")
+
+    uvicorn.run(
+        "main:api",
+        host="0.0.0.0",
+        port=port,
+        reload=(environment == "development")  # Only reload in dev mode
+    )

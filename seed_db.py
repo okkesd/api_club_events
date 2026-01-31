@@ -1,129 +1,143 @@
-import sys
-import os
+# seed_db.py
+import datetime
+from database import SessionLocal, engine
+import models, utils
+import re
 
-# 1. Add the current directory to Python path so we can import 'app'
-sys.path.append(os.getcwd())
-
-from app import models, database, utils
-from app.database import SessionLocal
+# --- HELPER: Slugify ---
+def simple_slugify(text):
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s-]', '', text)
+    return re.sub(r'\s+', '-', text)
 
 # --- MOCK DATA ---
-
 MOCK_CLUBS = [
     {
-        "id": "club-1",  # We force a specific ID so we can link events easily
-        "email": "tech@university.edu",
+        "id": "club-1",
         "club_name": "Tech & Coding Society",
-        "description": "We build cool apps, host hackathons, and drink too much coffee. Join us to learn React, Python, and AI.",
-        "logo_url": "https://api.dicebear.com/7.x/identicon/svg?seed=tech",
-        "banner_url": "/gsu_image.jpg"
+        "email": "tech@university.edu",
+        "description": "We build cool stuff with code. Join us for hackathons, workshops, and pizza nights.",
+        "logo_url": "https://api.dicebear.com/7.x/identicon/svg?seed=TechClub",
+        "banner_url": "https://images.unsplash.com/photo-1517694712202-14dd9538aa97?auto=format&fit=crop&q=80&w=1000",
+        "is_verified": True, # ✅ Verified Club
+        "rejection_reason": ""
     },
     {
         "id": "club-2",
-        "email": "music@university.edu",
         "club_name": "University Jazz Band",
-        "description": "Bringing smooth jazz and funk to the campus. We meet every Tuesday for jam sessions.",
-        "logo_url": "https://api.dicebear.com/7.x/identicon/svg?seed=music",
-        "banner_url": "https://images.unsplash.com/photo-1511192336575-5a79af67a629?auto=format&fit=crop&q=80&w=1000"
+        "email": "jazz@university.edu",
+        "description": "Smooth jazz and good vibes. We perform every Tuesday at the student center.",
+        "logo_url": "https://api.dicebear.com/7.x/identicon/svg?seed=Jazz",
+        "banner_url": "https://images.unsplash.com/photo-1511192336575-5a79af67a629?auto=format&fit=crop&q=80&w=1000",
+        "is_verified": True,  # ✅ Verified Club
+        "rejection_reason": ""
     },
     {
         "id": "club-3",
-        "email": "chess@university.edu",
         "club_name": "Grandmaster Chess Club",
-        "description": "From beginners to rated players. Come sharpen your mind and learn strategy.",
-        "logo_url": "https://api.dicebear.com/7.x/identicon/svg?seed=chess",
-        "banner_url": "https://images.unsplash.com/photo-1529699211952-734e80c4d42b?auto=format&fit=crop&q=80&w=1000"
+        "email": "chess@university.edu",
+        "description": "Strategy, tactics, and tournaments. Beginners welcome!",
+        "logo_url": "https://api.dicebear.com/7.x/identicon/svg?seed=Chess",
+        "banner_url": "https://images.unsplash.com/photo-1529699211952-734e80c4d42b?auto=format&fit=crop&q=80&w=1000",
+        "is_verified": False, # ❌ Unverified (Pending) - Good for testing Admin Panel
+        "rejection_reason": "pending review"
     }
 ]
 
 MOCK_EVENTS = [
     {
         "title": "Intro to Python Workshop",
-        "description": "Learn the basics of Python in this hands-on workshop. No prior experience needed! Bring your laptop.",
+        "description": "Learn the basics of Python programming. No prior experience needed!",
         "club_id": "club-1",
-        "date": "2026-01-25",
-        "start_time": "14:00",
-        "end_time": "16:00",
+        "date": datetime.date(2026, 1, 28),
+        "start_time": "10:00",
+        "end_time": "12:00",
         "duration": 2.0,
         "location_type": "on-campus",
-        "location": "Room 304, Science Block",
-        "cover_image": "https://images.unsplash.com/photo-1526379095098-d400fd0bf935?auto=format&fit=crop&q=80&w=1000"
+        "location": "Room 304",
+        "cover_image": "https://images.unsplash.com/photo-1546410531-bb4caa6b424d?auto=format&fit=crop&q=80&w=1000"
     },
     {
-        "title": "AI & The Future Talk",
-        "description": "A guest lecture from an industry expert on how AI is changing software engineering jobs.",
-        "club_id": "club-1",
-        "date": "2026-01-28",
-        "start_time": "18:00",
-        "end_time": "19:30",
-        "duration": 1.5,
-        "location_type": "on-campus",
-        "location": "Main Auditorium",
-        "cover_image": "" # Test empty image fallback
-    },
-    {
-        "title": "Jazz Night: Live Performance",
-        "description": "Relax after classes with some live jazz performed by our talented students. Free snacks!",
+        "title": "Jazz Night Live",
+        "description": "Live performance by the University Jazz Band. Free entry!",
         "club_id": "club-2",
-        "date": "2026-01-26",
-        "start_time": "19:00",
-        "end_time": "22:00",
-        "duration": 3.0,
-        "location_type": "off-campus",
-        "location": "The Blue Note Cafe, Downtown",
-        "cover_image": "https://images.unsplash.com/photo-1514525253440-b393452e8d26?auto=format&fit=crop&q=80&w=1000"
+        "date": datetime.date(2026, 1, 29),
+        "start_time": "18:00",
+        "end_time": "20:00",
+        "duration": 2.0,
+        "location_type": "on-campus",
+        "location": "Student Center",
+        "cover_image": "https://images.unsplash.com/photo-1415201364774-f6f0bb35f28f?auto=format&fit=crop&q=80&w=1000"
     },
     {
-        "title": "Spring Chess Tournament",
-        "description": "Swiss system tournament. 5 rounds. Winner gets a $50 gift card!",
+        "title": "Chess Tournament",
+        "description": "Monthly rapid chess tournament. Prizes for top 3.",
         "club_id": "club-3",
-        "date": "2026-02-01",
-        "start_time": "10:00",
-        "end_time": "15:00",
-        "duration": 5.0,
+        "date": datetime.date(2026, 1, 30),
+        "start_time": "14:00",
+        "end_time": "17:00",
+        "duration": 3.0,
         "location_type": "on-campus",
-        "location": "Student Center Hall B",
+        "location": "Library Hall",
         "cover_image": "https://images.unsplash.com/photo-1586165368502-1bad197a6461?auto=format&fit=crop&q=80&w=1000"
     }
 ]
 
-# --- SEEDING LOGIC ---
-
 def seed():
     print("🌱 Seeding Database...")
+    
+    # 1. Reset Tables (Drop & Create)
+    models.Base.metadata.drop_all(bind=engine)
+    models.Base.metadata.create_all(bind=engine)
+
     db = SessionLocal()
 
     try:
-        # 1. Clear existing data (Optional: Remove if you want to keep adding)
-        print("   Cleaning old data...")
-        db.query(models.Event).delete()
-        db.query(models.User).delete()
-        db.commit()
-
-        # 2. Create Clubs (Users)
-        print(f"   Creating {len(MOCK_CLUBS)} Clubs...")
-        
-        # We use a standard password for everyone for testing
         hashed_pwd = utils.hash_password("password123")
 
+        # --- 2. Create ADMIN User ---
+        print("   Creating Admin User...")
+        admin_user = models.User(
+            id="admin-1",
+            slug="system-admin",
+            email="admin@uni.edu",
+            hashed_password=hashed_pwd,
+            club_name="System Administrator",
+            description="Main platform administrator.",
+            role="admin",        # 🛡️ ROLE SET TO ADMIN
+            is_verified=True,    # Admins are always verified
+            logo_url="https://ui-avatars.com/api/?name=Admin&background=000&color=fff"
+        )
+        db.add(admin_user)
+
+        # --- 3. Create CLUBS ---
+        print(f"   Creating {len(MOCK_CLUBS)} Clubs...")
         for club_data in MOCK_CLUBS:
             user = models.User(
-                id=club_data["id"], # Force specific ID
+                id=club_data["id"],
+                slug=simple_slugify(club_data["club_name"]),
                 email=club_data["email"],
                 hashed_password=hashed_pwd,
                 club_name=club_data["club_name"],
                 description=club_data["description"],
                 logo_url=club_data["logo_url"],
-                banner_url=club_data["banner_url"]
+                banner_url=club_data["banner_url"],
+                
+                role="club",                # Default role
+                is_verified=club_data["is_verified"] # Mix of True/False
             )
             db.add(user)
         
-        db.commit() # Commit clubs so they exist for Foreign Keys
+        db.commit() # Commit users so IDs exist for events
 
-        # 3. Create Events
+        # --- 4. Create EVENTS ---
         print(f"   Creating {len(MOCK_EVENTS)} Events...")
         for event_data in MOCK_EVENTS:
+            # Unique Slug logic
+            raw_slug = f"{event_data['title']} {event_data['date']}"
+            
             event = models.Event(
+                slug=simple_slugify(raw_slug),
                 title=event_data["title"],
                 description=event_data["description"],
                 club_id=event_data["club_id"],
@@ -138,13 +152,10 @@ def seed():
             db.add(event)
 
         db.commit()
-        print("✅ Database populated successfully!")
-        print("   Test Login Credentials:")
-        print("   - Email: tech@university.edu")
-        print("   - Pass : password123")
+        print("✅ Seeding Complete!")
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print("❌ Error:", e)
         db.rollback()
     finally:
         db.close()
