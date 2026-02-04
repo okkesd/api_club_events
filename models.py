@@ -1,74 +1,70 @@
-# app/models.py
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Float, Text, Date
-from sqlalchemy.orm import relationship
-from .database import Base
+from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from database import Base
+from typing import Optional
+import datetime
 import uuid
 import re
 
-# Helper to generate IDs
 def generate_uuid():
     return str(uuid.uuid4())
 
-# Helper to generate slugs
 def generate_slug(text: str) -> str:
-    # 1. Lowercase
+    # Basic slugify: lowercase, remove special chars, replace space with dash
     text = text.lower()
-    # 2. Remove non-alphanumeric (keep hyphens)
     text = re.sub(r'[^a-z0-9\s-]', '', text)
-    # 3. Replace spaces with hyphens
     text = re.sub(r'\s+', '-', text)
     return text
 
 class User(Base):
     __tablename__ = "users"
 
-    # We use String for ID to keep it compatible with UUIDs if we want
-    id = Column(String, primary_key=True, default=generate_uuid) # type: ignore
-
-    slug: str = Column(String, unique=True, index=True) # type: ignore
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    slug: Mapped[str] = mapped_column(String, unique=True, index=True)
+    email: Mapped[str] = mapped_column(String, unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String)
     
-    # Auth details
-    email: str = Column(String, unique=True, index=True) # type: ignore
-    hashed_password: str = Column(String) # type: ignore
-    
-    # Club Profile details
-    club_name: str = Column(String, index=True) # type: ignore
-    description: str = Column(Text, nullable=True) # type: ignore
-    logo_url: str = Column(String, nullable=True) # type: ignore
-    banner_url: str = Column(String, nullable=True) # type: ignore
+    # Profile
+    club_name: Mapped[str] = mapped_column(String, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=True)
+    logo_url: Mapped[str] = mapped_column(String, nullable=True)
+    banner_url: Mapped[str] = mapped_column(String, nullable=True)
 
-    role = Column(String, default="club")
-    is_verified = Column(Boolean, default=False)
-    rejection_reason = Column(String, default="")
+    # Status / Access Control
+    role: Mapped[str] = mapped_column(String, default="club") # 'club', 'admin'
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True, default=None)
     
     # Relationships
-    events = relationship("Event", back_populates="owner")
-
+    events = relationship("Event", back_populates="owner", cascade="all, delete-orphan")
 
 class Event(Base):
     __tablename__ = "events"
 
-    id = Column(String, primary_key=True, default=generate_uuid)
-
-    slug = Column(String, unique=True, index=True)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    slug: Mapped[str] = mapped_column(String, unique=True, index=True)
     
-    # Fields from your Create Event form
-    title = Column(String, index=True)
-    description = Column(Text)
-    cover_image = Column(String, nullable=True)
+    # Content
+    title: Mapped[str] = mapped_column(String, index=True)
+    description: Mapped[str] = mapped_column(Text)
+    cover_image: Mapped[str] = mapped_column(String, nullable=True)
+    tags: Mapped[str] = mapped_column(String, default="") # Stored as comma-separated or JSON string usually
     
     # Time
-    date = Column(Date)       # Storing as ISO string "2026-01-18" is fine for now
-    start_time = Column(String) # "10:00"
-    duration: float = Column(Float)    # 1.5 # type: ignore
-    end_time = Column(String)   # "11:30"
+    date: Mapped[datetime.date] = mapped_column(Date, index=True)
+    start_time: Mapped[str] = mapped_column(String) # Format: "HH:MM"
+    end_time: Mapped[str] = mapped_column(String)   # Format: "HH:MM"
+    duration: Mapped[float] = mapped_column(Float)  # Hours (e.g. 1.5)
     
     # Location
-    location_type = Column(String) # "on-campus"
-    location = Column(String)
+    location_type: Mapped[str] = mapped_column(String) # 'on-campus', 'off-campus'
+    location: Mapped[str] = mapped_column(String)
     
-    # Relationship (Foreign Key) - Links an event to a specific Club
-    club_id = Column(String, ForeignKey("users.id"))
-    
-    # Navigation link back to the club
+    # Registration Logic (Future proofing based on schemas)
+    is_registration_open: Mapped[bool] = mapped_column(Boolean, default=False)
+    registration_link: Mapped[str] = mapped_column(String, nullable=True)
+    capacity: Mapped[int] = mapped_column(String, nullable=True) # or Integer
+
+    # Relationships
+    club_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"))
     owner = relationship("User", back_populates="events")
