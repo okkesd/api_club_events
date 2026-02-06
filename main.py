@@ -55,6 +55,8 @@ api.add_middleware(
     allow_headers=["*"]
 )
 
+os.makedirs("uploads", exist_ok=True)
+
 api.mount("/static", StaticFiles(directory="uploads"), name="static")
 
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
