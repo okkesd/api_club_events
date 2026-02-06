@@ -1,4 +1,5 @@
 import uuid
+import requests
 import os
 from dotenv import load_dotenv
 import shutil
@@ -7,26 +8,39 @@ import fastapi
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi import HTTPException, Query, FastAPI, File, UploadFile, status, Depends
+from fastapi import HTTPException, Query, FastAPI, File, UploadFile, status, Depends, Header, Request, Response, BackgroundTasks
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import datetime as dt
-from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import select, asc, desc
+from sqlalchemy.orm import Session, joinedload, contains_eager
+from sqlalchemy import select, asc, desc, or_
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import datetime
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from data import club_data, event_data
-from custom_types import *
 import database, models, schemas, utils
 
 models.Base.metadata.create_all(bind=database.engine)
 
 load_dotenv()
 
+VALID_API_KEY = os.getenv("API_SECRET_KEY")
+NEXTJS_URL = os.getenv("NEXTJS_APP_URL", "http://localhost:3000")
+REVALIDATION_TOKEN = os.getenv("REVALIDATION_TOKEN")
+
+# request limiter
+limiter = Limiter(key_func=get_remote_address)
+
 #create api
 api = FastAPI()
+
+# add limiter
+api.state.limiter = limiter
+api.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler) # type: ignore
 
 # middlewares
 origins = [
@@ -60,19 +74,63 @@ def get_week_range(ref_date_str: str):
         return start_of_week, end_of_week
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+# helper    
+async def verify_api_key(x_api_key: str = Header(None)):
+    if x_api_key != VALID_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
     
+# helper
+def revalidate_frontend(tags: list[str]):
+    """
+    Tells Next.js to purge cache for a list of tags.
+    Usage: revalidate_frontend(["events", "clubs"])
+    """
+    if not tags: 
+        return
+
+    # Join tags into a comma-separated string: "events,clubs"
+    tag_str = ",".join(tags)
+    
+    try:
+        # We send the list of tags as a query param
+        url = f"{NEXTJS_URL}/api/revalidate?tags={tag_str}&secret={REVALIDATION_TOKEN}"
+        
+        # 1. Fire and Forget (don't wait too long)
+        response = requests.post(url, timeout=2) 
+        
+        if response.status_code == 200:
+            print(f"✅ Revalidation triggered for: {tags}")
+        else:
+            print(f"⚠️ Revalidation failed: {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Error triggering revalidation: {e}")
+
+@api.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
 # main page request to get events
-@api.get("/events/weekly", response_model=schemas.MainResponse)
-async def weekly_events(date: str = Query(..., description="Any date within the desired week (YYYY-MM-DD)"), db: Session = Depends(database.get_db)): # obj: MainRequest
-
+@api.get("/events/weekly", response_model=schemas.MultiEventResponse)
+@limiter.limit("10/minute") # Only 10 requests allowed per IP per minute
+async def weekly_events(
+    request: Request,  
+    response: Response,
+    date: str = Query(..., description="Any date within the desired week (YYYY-MM-DD)"), 
+    db: Session = Depends(database.get_db), 
+    token: str = Depends(verify_api_key),
+):
+    
     try:
         week_beginning, week_end = get_week_range(date)
     
-        get_weekly_events_query = (select(models.Event, models.User)
-                                    .options(joinedload(models.Event.owner))
+        get_weekly_events_query = (select(models.Event)
+                                    .join(models.Event.owner)
+                                    .options(contains_eager(models.Event.owner))
                                     .where(models.Event.date >= week_beginning.date())
                                     .where(models.Event.date < week_end.date())
+                                    .order_by(models.Event.date.asc())
                                 )
         result = db.execute(get_weekly_events_query)
     
@@ -81,48 +139,41 @@ async def weekly_events(date: str = Query(..., description="Any date within the 
         data_to_send = []
         
         for event in db_events:
-            # 1. Attach the club_name to the event object so Pydantic can find it
-            event_complex = schemas.EventDataComplex(
-                id=event.id,
+            
+            event_dto = schemas.EventResponse(
+                # 1. Flattened Fields (Manual)
+                club_name=event.owner.club_name if event.owner else "Unknown",
+                
+                # 2. Direct Fields (Pydantic maps these automatically)
+                id=str(event.id),
+                club_id=str(event.club_id),
                 title=event.title,
                 description=event.description,
-                
-                # Error 1 Fix: Map club_id -> clubID
-                clubID=event.club_id,
-                
-                # Error 2 Fix: Extract club_name from the relation -> clubName
-                clubName=event.owner.club_name if event.owner else "Unknown Club", 
-                
-                # Error 3 Fix: Convert python date object -> string
-                date=str(event.date),       
-                
-                # Error 4 Fix: Map start_time -> startTime
-                startTime=event.start_time, 
-                endTime=event.end_time,
+                date=event.date, # Pydantic handles date -> string conversion
+                start_time=event.start_time,
+                end_time=event.end_time,
                 duration=event.duration,
-                
-                # Error 5 Fix: Map location_type -> locationType
-                locationType=event.location_type,
+                location_type=event.location_type,
                 location=event.location,
+                cover_image=event.cover_image,
                 
-                # Optional fields
-                coverImage=event.cover_image,
-                tags=[], # Default empty list
-                isRegistrationOpen=False, # Default
-                registrationLink=None,
-                capacity=None
+                # 3. Defaults/Computed
+                is_registration_open=event.is_registration_open,
+                registration_link=event.registration_link,
+                capacity=event.capacity if hasattr(event, 'capacity') else None
             )
-            data_to_send.append(event_complex)
+            data_to_send.append(event_dto)
+
+        # ✅ Correct Return Type: MultiEventResponse (for lists)
+        return schemas.MultiEventResponse(success=True, data=data_to_send)
 
     except Exception as e:
-        print("exception: ", e)
-        raise HTTPException(status_code=500, detail=f"Exception occured in weekly events: {str(e)}")
-
-    return schemas.MainResponse(success=True, data=data_to_send)
+        print(f"❌ CRITICAL ERROR in weekly_events: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error. Please contact support.")
 
 
 # get single event
-@api.get("/events/{event_id}", response_model=schemas.EventResponse)
+@api.get("/events/{event_id}", response_model=schemas.SingleEventResponse)
 async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
 
     try:
@@ -140,34 +191,34 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
             raise HTTPException(404, detail="Event not found")
                 
 
-        event_complex = schemas.EventDataComplex(
+        event_complex = schemas.EventResponse(
             id=str(event.id),
             title=str(event.title),
             description=str(event.description),
             
             # Club Info (Fetched via joinedload)
-            clubID=str(event.club_id),
-            clubName=event.owner.club_name if event.owner else "Unknown Club",
+            club_id=str(event.club_id),
+            club_name=event.owner.club_name if event.owner else "Unknown Club",
             
             # Time
-            date=str(event.date),
-            startTime=str(event.start_time),
-            endTime=str(event.end_time),
+            date=event.date,
+            start_time=str(event.start_time),
+            end_time=str(event.end_time),
             duration=float(event.duration),
             
             # Location
-            locationType=str(event.location_type),
+            location_type=str(event.location_type),
             location=str(event.location),
             
             # Visuals & Details
-            coverImage=str(event.cover_image),
-            tags=[], 
-            isRegistrationOpen=False,
-            registrationLink=None,
-            capacity=None
+            cover_image=str(event.cover_image),
+            tags=list(event.tags), 
+            is_registration_open=event.is_registration_open,
+            registration_link=event.registration_link,
+            capacity=event.capacity
         )
 
-        return schemas.EventResponse(success=True, data=event_complex)
+        return schemas.SingleEventResponse(success=True, data=event_complex)
             
     except HTTPException as he: # re-raise
         raise he
@@ -179,7 +230,7 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
     
 
 # get single club
-@api.get("/clubs/{club_id}", response_model=schemas.ClubResponse)
+@api.get("/clubs/{club_id}", response_model=schemas.ClubApiResponse)
 async def handle_club(club_id: str, db: Session = Depends(database.get_db)):
 
     try:
@@ -193,20 +244,20 @@ async def handle_club(club_id: str, db: Session = Depends(database.get_db)):
         if not club:
             raise HTTPException(404, detail=f"No event found with id {club_id}")
         
-        club_data = schemas.ClubData(
+        club_data = schemas.ClubResponse(
             id = str(club.id),
             slug = club.slug,
-            clubName= club.club_name,
+            club_name= club.club_name,
             email = club.email,
             description= club.description,
-            logoUrl= club.logo_url,
-            bannerUrl= club.banner_url,
+            logo_url= club.logo_url,
+            banner_url= club.banner_url,
             is_verified=bool(club.is_verified),
             role=str(club.role),
-            rejectionReason=str(club.rejection_reason)
+            rejection_reason=str(club.rejection_reason)
         )
         
-        return schemas.ClubResponse(success=True, data=club_data)
+        return schemas.ClubApiResponse(success=True, data=club_data)
             
     except Exception as e:
         print("exception: ", e)
@@ -215,7 +266,7 @@ async def handle_club(club_id: str, db: Session = Depends(database.get_db)):
 
     
 # get club's events
-@api.get("/clubs/{club_id}/events", response_model=schemas.EventsResponse)
+@api.get("/clubs/{club_id}/events", response_model=schemas.MultiEventResponse)
 async def handle_club_events(club_id: str, db: Session = Depends(database.get_db)):
 
     try:
@@ -233,33 +284,33 @@ async def handle_club_events(club_id: str, db: Session = Depends(database.get_db
         clubs_events = []
         for event in result:
     
-            event_to_return = schemas.EventDataComplex(
+            event_to_return = schemas.EventResponse(
                 id = str(event.id),
                 title = str(event.title),
                 description= str(event.description),
-                clubID=str(event.club_id),
-                clubName=event.owner.club_name if event.owner else "Unknown Club",
+                club_id=str(event.club_id),
+                club_name=event.owner.club_name if event.owner else "Unknown Club",
                 
                 # Time
-                date=str(event.date),
-                startTime=str(event.start_time),
-                endTime=str(event.end_time),
+                date=event.date,
+                start_time=str(event.start_time),
+                end_time=str(event.end_time),
                 duration=float(event.duration),
                 
                 # Location
-                locationType=str(event.location_type),
+                location_type=str(event.location_type),
                 location=str(event.location),
                 
                 # Visuals & Details
-                coverImage=str(event.cover_image),
-                tags=[], 
-                isRegistrationOpen=False,
-                registrationLink=None,
-                capacity=None
+                cover_image=str(event.cover_image),
+                tags=list(event.tags), 
+                is_registration_open=event.is_registration_open,
+                registration_link=event.registration_link,
+                capacity=event.capacity
             )
             clubs_events.append(event_to_return)
     
-        return schemas.EventsResponse(success=True, data=clubs_events)
+        return schemas.MultiEventResponse(success=True, data=clubs_events)
 
     except Exception as e:
         print("Exception: ", e)
@@ -349,9 +400,10 @@ async def login_for_access_token(
 
 
 # posting an event (IMPORTANT NOTE: when an event is created (with mock up auth), it doesnt show up as expected in calendar, maybe its about auth or admin)
-@api.post("/events", response_model=schemas.CreateEventResponse)
+@api.post("/events", response_model=schemas.SingleEventResponse)
 async def create_event(
     event_in: schemas.EventCreate, 
+    bg_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db)
 ):
     
@@ -383,13 +435,17 @@ async def create_event(
         title=event_in.title,
         description=event_in.description,
         club_id=event_in.club_id,
-        date=datetime.strptime(event_in.date, "%Y-%m-%d").date(), # Convert Str -> Date
+        date=event_in.date, # Convert Str -> Date
         start_time=event_in.start_time,
         end_time=event_in.end_time,
         duration=event_in.duration,
         location_type=event_in.location_type,
         location=event_in.location,
         cover_image=event_in.cover_image,
+        tags=list(event_in.tags), 
+        is_registration_open=event_in.is_registration_open,
+        registration_link=event_in.registration_link,
+        capacity=event_in.capacity
         # If your DB doesn't have 'tags' or 'registration' columns yet, 
         # you might need to skip these or add them to models.py first!
     )
@@ -401,26 +457,28 @@ async def create_event(
         
         # 3. Return the complex response (fetches club name automatically via relationship)
         # We re-query or just construct it manually to match the response schema
-        created_event = schemas.EventDataComplex(
+        created_event = schemas.EventResponse(
             id=str(db_event.id),
             title=str(db_event.title),
             description=str(db_event.description),
-            clubID=str(db_event.club_id),
-            clubName=db_event.owner.club_name if db_event.owner else "Loading...",
-            date=str(db_event.date),
-            startTime=str(db_event.start_time),
-            endTime=str(db_event.end_time),
+            club_id=str(db_event.club_id),
+            club_name=db_event.owner.club_name if db_event.owner else "Loading...",
+            date=db_event.date,
+            start_time=str(db_event.start_time),
+            end_time=str(db_event.end_time),
             duration=db_event.duration,
-            locationType=str(db_event.location_type),
+            location_type=str(db_event.location_type),
             location=str(db_event.location),
-            coverImage=str(db_event.cover_image),
-            tags=[], 
-            isRegistrationOpen=False,
-            registrationLink=None,
-            capacity=None
+            cover_image=str(db_event.cover_image),
+            tags=list(db_event.tags), 
+            is_registration_open=db_event.is_registration_open,
+            registration_link=db_event.registration_link,
+            capacity=db_event.capacity
         )
 
-        return schemas.CreateEventResponse(success=True, data=created_event)
+        bg_tasks.add_task(revalidate_frontend, ["events"])
+
+        return schemas.SingleEventResponse(success=True, data=created_event)
         
     except Exception as e:
         db.rollback()
@@ -428,7 +486,7 @@ async def create_event(
         raise HTTPException(status_code=500, detail="Could not create event")
 
 # get all clubs for the admin page and club list
-@api.get("/all_clubs", response_model=schemas.AllClubs)
+@api.get("/all_clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs(db: Session = Depends(database.get_db)):
 
     try:
@@ -443,31 +501,32 @@ async def get_all_clubs(db: Session = Depends(database.get_db)):
         
         clubs_to_return = []
         for club in result:
-            club_to_add = schemas.ClubData(
+            club_to_add = schemas.ClubResponse(
                 id=str(club.id),
                 slug=club.slug,
-                clubName=club.club_name,
+                club_name=club.club_name,
                 email=club.email,
                 description=club.description,
-                logoUrl=club.logo_url,
-                bannerUrl=club.banner_url,
+                logo_url=club.logo_url,
+                banner_url=club.banner_url,
                 is_verified=bool(club.is_verified),
                 role=str(club.role),
-                rejectionReason=str(club.rejection_reason)
+                rejection_reason=str(club.rejection_reason)
             )
 
             clubs_to_return.append(club_to_add)
 
-        return schemas.AllClubs(success=True, data=clubs_to_return)
+        return schemas.AllClubsResponse(success=True, data=clubs_to_return)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting all clubs: {e}")
 
 # club update (profile update) by admin or club owner
-@api.patch("/clubs/{club_id}", response_model=schemas.ClubResponse)
+@api.patch("/clubs/{club_id}", response_model=schemas.ClubApiResponse)
 async def update_club(
     club_id: str, 
     club_update: schemas.ClubUpdate, 
+    bg_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db)
 ):
     # 1. Fetch the existing Club (User)
@@ -485,8 +544,8 @@ async def update_club(
 
     # 2. Update fields if they are provided in the request
     # We check if value is not None so we don't accidentally erase data
-    if club_update.clubName is not None:
-        club.club_name = club_update.clubName
+    if club_update.club_name is not None:
+        club.club_name = club_update.club_name
         
     if club_update.email is not None:
         club.email = club_update.email
@@ -504,29 +563,31 @@ async def update_club(
     try:
         db.commit()
         db.refresh(club) # Reloads the object with new data from DB
+
+        bg_tasks.add_task(revalidate_frontend, ["clubs", "events"])
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update club: {str(e)}")
 
     # 4. Return the updated club (formatted for the response schema)
-    return schemas.ClubResponse(
+    return schemas.ClubApiResponse(
         success=True,
-        data=schemas.ClubData(
+        data=schemas.ClubResponse(
             id=str(club.id),
             slug=club.slug,
             email=club.email,
-            clubName=club.club_name,
+            club_name=club.club_name,
             description=club.description,
-            logoUrl=club.logo_url,
-            bannerUrl=club.banner_url,
+            logo_url=club.logo_url,
+            banner_url=club.banner_url,
             is_verified=bool(club.is_verified),
             role=str(club.role),
-            rejectionReason=str(club.rejection_reason)
+            rejection_reason=str(club.rejection_reason)
         )
     )
 
 # get all clubs for admin
-@api.get("/admin/clubs", response_model=List[schemas.ClubData])
+@api.get("/admin/clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs_admin(
     status: Optional[str] = None, # Optional filter: 'verified', 'pending'
     db: Session = Depends(database.get_db)
@@ -549,28 +610,29 @@ async def get_all_clubs_admin(
     clubs = db.execute(query).scalars().all()
     clubs_to_return = []
     for club in clubs:
-        c = schemas.ClubData(
+        c = schemas.ClubResponse(
             id=str(club.id),
             slug=club.slug,
             email=club.email,
-            clubName=club.club_name,
+            club_name=club.club_name,
             description=club.description,
-            logoUrl=club.logo_url,
-            bannerUrl=club.banner_url,
+            logo_url=club.logo_url,
+            banner_url=club.banner_url,
             is_verified=bool(club.is_verified),
             role=str(club.role),
-            rejectionReason=str(club.rejection_reason)
+            rejection_reason=str(club.rejection_reason)
         )
         clubs_to_return.append(c)
     print(clubs_to_return)
-    return clubs_to_return
+    return schemas.AllClubsResponse(success=True, data=clubs_to_return)
 
 
-# change club's status with admin user
-@api.patch("/admin/clubs/{club_id}/status", response_model=schemas.ClubResponse)
+# 1. ADMIN: SET CLUB STATUS
+@api.patch("/admin/clubs/{club_id}/status", response_model=schemas.ClubApiResponse)
 async def set_club_verification(
     club_id: str,
     status_update: schemas.ClubStatusUpdate,
+    bg_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db)
 ):
     """
@@ -581,44 +643,52 @@ async def set_club_verification(
         raise HTTPException(status_code=404, detail="Club not found")
         
     # Update Status
-    club.is_verified = status_update.is_verified # type: ignore
+    club.is_verified = status_update.is_verified
     
-    # 2. Handle Rejection Reason
+    # Handle Rejection Reason
     if status_update.is_verified:
-        #  CLEANUP: If approved, clear any old rejection reasons
-        club.rejection_reason = "" # type: ignore
+        # CLEANUP: If approved, clear any old rejection reasons (set to None or empty string)
+        club.rejection_reason = None 
     else:
         # If rejected, require/store the reason
-        club.rejection_reason = status_update.rejection_reason # type: ignore
+        club.rejection_reason = status_update.rejection_reason
 
     try:
         db.commit()
         db.refresh(club)
-        print(f"changing {club.id}'s status to {club.is_verified}")
+        bg_tasks.add_task(revalidate_frontend, ["clubs"])
+
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to update verification status.")
     
-    club_to_return = schemas.ClubData(
-        id=str(club.id),
-        slug=club.slug,
-        email=club.email,
-        clubName=club.club_name,
-        description=club.description,
-        logoUrl=club.logo_url,
-        bannerUrl=club.banner_url,
-        is_verified=bool(club.is_verified),
-        role=str(club.role),
-        rejectionReason=str(club.rejection_reason)
+    # Return using the Wrapper (ClubApiResponse) -> Data (ClubResponse)
+    return schemas.ClubApiResponse(
+        success=True,
+        data=schemas.ClubResponse(
+            id=str(club.id),
+            slug=club.slug,
+            email=club.email,
+            
+            # Pass snake_case args; CamelModel handles "clubName", "logoUrl", etc.
+            club_name=club.club_name,
+            description=club.description,
+            logo_url=club.logo_url,
+            banner_url=club.banner_url,
+            
+            is_verified=club.is_verified,
+            role=club.role,
+            rejection_reason=club.rejection_reason
+        )
     )
-    
-    return schemas.ClubResponse(success=True, data=club_to_return)
 
 
-@api.patch("/events/{event_id}", response_model=schemas.EventDataComplex)
+# 2. CLUB: UPDATE EVENT
+@api.patch("/events/{event_id}", response_model=schemas.SingleEventResponse)
 async def update_event(
     event_id: str,
     event_update: schemas.EventUpdate,
+    bg_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db)
 ):
     # 1. Find Event
@@ -629,59 +699,125 @@ async def update_event(
     # 2. Get the Club (Owner)
     club = db.query(models.User).filter(models.User.id == db_event.club_id).first()
 
-    # 3. PERMISSION CHECK (Mock Auth - in real app, use Depends(get_current_user))
-    # We assume the Frontend sends the request. 
-    # In a real app, you MUST compare current_user.id with db_event.club_id here.
-    # For now, we rely on the frontend check + validation logic below.
     if not club:
-        return HTTPException(status_code=500, detail="Error occured in update event.")
+        raise HTTPException(status_code=500, detail="Event owner not found.")
     
-    if not bool(club.is_verified) and str(club.role) != "admin":
+    # 3. Permission Check
+    if not club.is_verified and club.role != "admin":
          raise HTTPException(status_code=403, detail="Unverified clubs cannot edit events.")
 
     # 4. Update Fields
-    # Only update what is sent
-    if event_update.title is not None: db_event.title = event_update.title # type: ignore
-    if event_update.description is not None: db_event.description = event_update.description # type: ignore
-    if event_update.location is not None: db_event.location = event_update.location # type: ignore
-    if event_update.location_type is not None: db_event.location_type = event_update.location_type # type: ignore
-    if event_update.cover_image is not None: db_event.cover_image = event_update.cover_image # type: ignore
+    # Only update what is sent (Pydantic models exclude_unset=True is handled manually here for safety)
     
-    # Time Logic Updates
+    if event_update.title is not None: db_event.title = event_update.title
+    if event_update.description is not None: db_event.description = event_update.description
+    if event_update.location is not None: db_event.location = event_update.location
+    if event_update.location_type is not None: db_event.location_type = event_update.location_type
+    if event_update.cover_image is not None: db_event.cover_image = event_update.cover_image
+    
+    # Time Logic
     if event_update.date is not None:
-         db_event.date = datetime.strptime(event_update.date, "%Y-%m-%d").date() # type: ignore
+         # No need for strptime! Pydantic 'EventUpdate' schema already parsed this into a date object.
+         db_event.date = event_update.date 
     
-    if event_update.start_time is not None: db_event.start_time = event_update.start_time # type: ignore
-    if event_update.end_time is not None: db_event.end_time = event_update.end_time # type: ignore
+    if event_update.start_time is not None: db_event.start_time = event_update.start_time
+    if event_update.end_time is not None: db_event.end_time = event_update.end_time
     if event_update.duration is not None: db_event.duration = event_update.duration
+
+    # Registration Logic (Update these too!)
+    if event_update.is_registration_open is not None: 
+        db_event.is_registration_open = event_update.is_registration_open
+    if event_update.registration_link is not None: 
+        db_event.registration_link = event_update.registration_link
+    if event_update.capacity is not None: 
+        db_event.capacity = event_update.capacity
 
     try:
         db.commit()
         db.refresh(db_event)
+
+        bg_tasks.add_task(revalidate_frontend, ["events"])
+
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to update event")
 
     # 5. Return (Map to Schema)
-    return schemas.EventDataComplex(
-        id=str(db_event.id),
-        title=str(db_event.title),
-        description=str(db_event.description),
-        clubID=str(db_event.club_id),
-        clubName=club.club_name,
-        date=str(db_event.date),
-        startTime=str(db_event.start_time),
-        endTime=str(db_event.end_time),
-        duration=db_event.duration,
-        locationType=str(db_event.location_type),
-        location=str(db_event.location),
-        coverImage=str(db_event.cover_image),
-        tags=[], 
-
-        # IMPORTANT NOTE: why these are directly setted ????
-        isRegistrationOpen=False, registrationLink=None, capacity=None
-        
+    return schemas.SingleEventResponse(
+        success=True,
+        data=schemas.EventResponse(
+            id=str(db_event.id),
+            
+            # Flatten club_name from the relationship
+            club_id=str(db_event.club_id),
+            club_name=club.club_name,
+            
+            title=db_event.title,
+            description=db_event.description,
+            date=db_event.date,
+            start_time=db_event.start_time,
+            end_time=db_event.end_time,
+            duration=db_event.duration,
+            location_type=db_event.location_type,
+            location=db_event.location,
+            cover_image=db_event.cover_image,
+            tags=list(db_event.tags), 
+            
+            # ✅ FIX: Use the actual values from DB (or updated values)
+            is_registration_open=db_event.is_registration_open,
+            registration_link=db_event.registration_link,
+            capacity=int(db_event.capacity) if db_event.capacity else None
+        )
     )
+
+@api.get("/clubs", response_model=schemas.AllClubsResponse)
+async def get_all_clubs_user(
+    search: Optional[str] = None, 
+    db: Session = Depends(database.get_db)
+):
+    """
+    Public directory of all verified clubs.
+    """
+    query = db.query(models.User).filter(
+        models.User.role == "club",
+        models.User.is_verified == True
+    )
+
+    if search:
+        search_fmt = f"%{search}%"
+        query = query.filter(
+            or_(
+                models.User.club_name.ilike(search_fmt),
+                models.User.description.ilike(search_fmt)
+            )
+        )
+    
+    # Sort alphabetically
+    query = query.order_by(models.User.club_name.asc())
+    
+    clubs = query.all()
+
+    clubs_to_return = []
+
+    for cl in clubs:
+        clubs_to_return.append(schemas.ClubResponse(
+            id=str(cl.id),
+            slug=cl.slug,
+            email=cl.email,
+            
+            # Pass snake_case args; CamelModel handles "clubName", "logoUrl", etc.
+            club_name=cl.club_name,
+            description=cl.description,
+            logo_url=cl.logo_url,
+            banner_url=cl.banner_url,
+            
+            is_verified=cl.is_verified,
+            role=cl.role,
+            rejection_reason=cl.rejection_reason
+        ))
+
+    return schemas.AllClubsResponse(success=True, data=clubs_to_return)
+
 
 if __name__ == "__main__":
 

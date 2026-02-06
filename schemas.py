@@ -1,169 +1,129 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from typing import Optional, List
+import datetime
 
-# --- USER SCHEMAS ---
+# --- BASE CONFIG ---
+class CamelModel(BaseModel):
+    """
+    Base model that automatically maps python_snake_case to jsonCamelCase.
+    """
+    model_config = ConfigDict(
+        from_attributes=True, 
+        populate_by_name=True, 
+        alias_generator=lambda s: "".join(
+            word.capitalize() if i > 0 else word 
+            for i, word in enumerate(s.split('_'))
+        )
+    )
 
-# What the frontend sends to US
-class UserCreate(BaseModel):
-    email: EmailStr
-    password: str
-    club_name: str
-    description: Optional[str] = None
+# --- SHARED/GENERIC RESPONSES ---
+class ApiResponse(CamelModel):
+    success: bool
+    error_msg: Optional[str] = None
 
-# What WE send back to the frontend (No password!)
-class UserResponse(BaseModel):
-    id: str
-    email: EmailStr
-    club_name: str
-    
-    class Config:
-        # This tells Pydantic to read data even if it's an ORM object (not just a dict)
-        from_attributes = True
+# --- AUTH & USERS ---
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
-class TokenData(BaseModel):
-    email: Optional[str] = None
+class UserCreate(CamelModel):
+    email: EmailStr
+    password: str
+    club_name: str
+    description: Optional[str] = None
 
-
-class EventDataComplex(BaseModel):
-    # Identity
+class UserResponse(CamelModel):
     id: str
-    title: str
-    description: str
-    
-    # Club Info (The "Complex" part)
-    clubID: str      # Matches frontend interface 'clubID'
-    clubName: str    # Joined from User table
-    
-    # Time
-    date: str        # ISO String "YYYY-MM-DD"
-    startTime: str   # "HH:MM"
-    endTime: Optional[str] = None
-    duration: float
-    
-    # Location
-    location: str
-    locationType: str # "on-campus" | "off-campus"
-    
-    # Visuals
-    coverImage: Optional[str] = None
-    
-    # Details & Registration
-    # We set defaults here so the API doesn't crash if these are null in the DB
-    tags: List[str] = [] 
-    isRegistrationOpen: bool = False
-    registrationLink: Optional[str] = None
-    capacity: Optional[int] = None
-
-    class Config:
-        # This allows Pydantic to read data from SQLAlchemy models if needed
-        from_attributes = True
-
-class MainResponse(BaseModel):
-    success: bool
-    data: Optional[List[EventDataComplex]] = None
-    error_msg: Optional[str] = None
-
-
-class EventResponse(BaseModel):
-    success: bool
-    data: Optional[EventDataComplex] = None
-    error_msg: Optional[str] = None
-
-class ClubData(BaseModel):
-    id: str
-    slug: str
-    email:str
-    clubName: str
-    description: Optional[str]
-    logoUrl: Optional[str]
-    bannerUrl: Optional[str]
-
-    is_verified: bool
+    email: EmailStr
+    club_name: str
     role: str
-    rejectionReason: str
-
-    class Config:
-        from_attributes = True
+    is_verified: bool
     
+    # Optional profile fields that might be empty initially
+    logo_url: Optional[str] = None
+    banner_url: Optional[str] = None
 
-class ClubResponse(BaseModel):
-    success: bool
-    data: Optional[ClubData] = None
-    error_msg: Optional[str] = None
+# --- CLUBS ---
 
-class EventsResponse(BaseModel):
-    success: bool
-    data: Optional[List[EventDataComplex]] = None
-    error_msg: Optional[str] = None
-
-
-class EventCreate(BaseModel):
-    # Required Fields
-    title: str
-    description: str
-    club_id: str = Field(..., alias="clubId")
-    date: str
-    start_time: str = Field(..., alias="startTime")
-    end_time: str = Field(..., alias="endTime")
-    duration: float
-    location_type: str = Field(..., alias="locationType")
-    location: str
-    
-    # Optional Fields
-    cover_image: Optional[str] = Field(None, alias="coverImage")
-    tags: List[str] = []
-    
-    # Registration
-    # Map 'isRegistrationRequired' (Frontend) to 'is_registration_open' (likely DB logic)
-    is_registration_open: bool = Field(False, alias="isRegistrationRequired")
-    registration_link: Optional[str] = Field(None, alias="registrationLink")
-    capacity: Optional[int] = None
-
-    class Config:
-        populate_by_name = True
-
-class CreateEventResponse(BaseModel):
-    success: bool
-    data: Optional[EventDataComplex] = None
-    error_msg: Optional[str] = None
-
-class AllClubs(BaseModel):
-    success: bool
-    data: Optional[List[ClubData]]
-
-class ClubUpdate(BaseModel):
-    # We use camelCase here to match the Frontend, but map to snake_case manually or via alias
-    clubName: Optional[str] = None
-    email: Optional[str] = None
+class ClubBase(CamelModel):
+    club_name: str
+    email: EmailStr
     description: Optional[str] = None
     logo_url: Optional[str] = None
     banner_url: Optional[str] = None
     
-    # NOTE: 'website' and 'tags' are commented out until we add them to the Database Model
+    # Future-proofing (Add to DB later if needed)
     # website: Optional[str] = None 
-    # tags: Optional[List[str]] = None
+    # socials: Optional[dict] = None
 
-    class Config:
-        from_attributes = True
+class ClubUpdate(CamelModel):
+    club_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    description: Optional[str] = None
+    logo_url: Optional[str] = None
+    banner_url: Optional[str] = None
 
-# club status update by admin (chaning is_verified and rejection_reason)
-class ClubStatusUpdate(BaseModel):
+class ClubStatusUpdate(CamelModel):
     is_verified: bool
     rejection_reason: Optional[str] = None
 
-# event update by club owner (changing event infos as they wish)
-class EventUpdate(BaseModel):
+class ClubResponse(ClubBase):
+    id: str
+    slug: str
+    role: str
+    is_verified: bool
+    rejection_reason: Optional[str] = None
+
+class ClubApiResponse(ApiResponse):
+    data: Optional[ClubResponse] = None
+
+class AllClubsResponse(ApiResponse):
+    data: List[ClubResponse]
+
+# --- EVENTS ---
+
+class EventBase(CamelModel):
+    title: str
+    description: str
+    date: datetime.date  # Pydantic handles "YYYY-MM-DD" string -> date obj conversion
+    start_time: str
+    end_time: str
+    duration: float
+    location_type: str
+    location: str
+    cover_image: Optional[str] = None
+    tags: List[str] = []
+    
+    # Registration Logic
+    is_registration_open: bool = False
+    registration_link: Optional[str] = None
+    capacity: Optional[int] = None
+
+class EventCreate(EventBase):
+    club_id: str
+
+class EventUpdate(CamelModel):
     title: Optional[str] = None
     description: Optional[str] = None
-    date: Optional[str] = None      # "YYYY-MM-DD"
-    start_time: Optional[str] = None # "10:00"
-    end_time: Optional[str] = None   # "12:00"
+    date: Optional[datetime.date] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
     duration: Optional[float] = None
     location_type: Optional[str] = None
     location: Optional[str] = None
     cover_image: Optional[str] = None
-    # Add other fields like capacity or registration link if needed
+    is_registration_open: Optional[bool] = None
+    registration_link: Optional[str] = None
+    capacity: Optional[int] = None
+
+class EventResponse(EventBase):
+    id: str
+    club_id: str
+    club_name: str  # Flattened from relation for easy UI access
+
+class SingleEventResponse(ApiResponse):
+    data: Optional[EventResponse] = None
+
+class MultiEventResponse(ApiResponse):
+    data: List[EventResponse]
