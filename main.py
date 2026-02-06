@@ -107,6 +107,10 @@ def revalidate_frontend(tags: list[str]):
     except Exception as e:
         print(f"❌ Error triggering revalidation: {e}")
 
+@api.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
 # main page request to get events
 @api.get("/events/weekly", response_model=schemas.MultiEventResponse)
 @limiter.limit("10/minute") # Only 10 requests allowed per IP per minute
