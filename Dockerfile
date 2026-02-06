@@ -33,7 +33,7 @@ EXPOSE 4444
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4444')" || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:4444/health')" || exit 1
 
 # Run application
 CMD ["python3", "main.py"]
