@@ -1,10 +1,13 @@
 import uuid
 import requests
 import os
+from pathlib import Path
+import secrets
 from dotenv import load_dotenv
 import shutil
 import uvicorn
 import fastapi
+import logging
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordRequestForm
@@ -15,7 +18,7 @@ import datetime as dt
 from sqlalchemy.orm import Session, joinedload, contains_eager
 from sqlalchemy import select, asc, desc, or_
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -31,6 +34,17 @@ load_dotenv()
 VALID_API_KEY = os.getenv("API_SECRET_KEY")
 NEXTJS_URL = os.getenv("NEXTJS_APP_URL", "http://localhost:3000")
 REVALIDATION_TOKEN = os.getenv("REVALIDATION_TOKEN")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # request limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -59,10 +73,15 @@ os.makedirs("uploads", exist_ok=True)
 
 api.mount("/static", StaticFiles(directory="uploads"), name="static")
 
-ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+ALLOWED_CONTENT_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp"
+}
 
 # helper
-def get_week_range(ref_date_str: str):
+def get_week_range(ref_date_str: str) -> Tuple[datetime, datetime]:
     try:
         # Parse the input string "2026-01-18"
         dt = datetime.strptime(ref_date_str, "%Y-%m-%d")
@@ -102,12 +121,50 @@ def revalidate_frontend(tags: list[str]):
         response = requests.post(url, timeout=2) 
         
         if response.status_code == 200:
-            print(f"✅ Revalidation triggered for: {tags}")
+            logger.info(f"✅ Revalidation triggered for: {tags}")
         else:
-            print(f"⚠️ Revalidation failed: {response.text}")
+            logger.info(f"⚠️ Revalidation failed: {response.text}")
             
     except Exception as e:
-        print(f"❌ Error triggering revalidation: {e}")
+        logger.info(f"❌ Error triggering revalidation: {e}")
+
+# helper
+def map_event_to_response(event: models.Event) -> schemas.EventResponse:
+    """Convert Event model to EventResponse schema."""
+    return schemas.EventResponse(
+        id=str(event.id),
+        club_id=str(event.club_id),
+        club_name=event.owner.club_name if event.owner else "Unknown",
+        title=event.title,
+        description=event.description,
+        date=event.date,
+        start_time=event.start_time,
+        end_time=event.end_time,
+        duration=event.duration,
+        location_type=event.location_type,
+        location=event.location,
+        cover_image=event.cover_image,
+        tags=list(event.tags) if isinstance(event.tags, list) else [],
+        is_registration_open=event.is_registration_open,
+        registration_link=event.registration_link,
+        capacity=int(event.capacity) if event.capacity else None
+    )
+
+# helper
+def map_club_to_response(club: models.User) -> schemas.ClubResponse:
+    """Convert Event model to ClubResponse schema."""
+    return schemas.ClubResponse(
+            id = str(club.id),
+            club_name= club.club_name,
+            email = club.email,
+            description= club.description,
+            logo_url= club.logo_url,
+            banner_url= club.banner_url,
+            is_verified=bool(club.is_verified),
+            role=str(club.role),
+            rejection_reason=str(club.rejection_reason)
+        )
+
 
 @api.get("/health")
 async def health_check():
@@ -142,35 +199,18 @@ async def weekly_events(
         
         for event in db_events:
             
-            event_dto = schemas.EventResponse(
-                # 1. Flattened Fields (Manual)
-                club_name=event.owner.club_name if event.owner else "Unknown",
-                
-                # 2. Direct Fields (Pydantic maps these automatically)
-                id=str(event.id),
-                club_id=str(event.club_id),
-                title=event.title,
-                description=event.description,
-                date=event.date, # Pydantic handles date -> string conversion
-                start_time=event.start_time,
-                end_time=event.end_time,
-                duration=event.duration,
-                location_type=event.location_type,
-                location=event.location,
-                cover_image=event.cover_image,
-                
-                # 3. Defaults/Computed
-                is_registration_open=event.is_registration_open,
-                registration_link=event.registration_link,
-                capacity=event.capacity if hasattr(event, 'capacity') else None
-            )
+            event_dto = map_event_to_response(event)
             data_to_send.append(event_dto)
 
         # ✅ Correct Return Type: MultiEventResponse (for lists)
         return schemas.MultiEventResponse(success=True, data=data_to_send)
 
+    except HTTPException as he:
+        raise he
+    
     except Exception as e:
-        print(f"❌ CRITICAL ERROR in weekly_events: {e}")
+        logger.info(f"❌ CRITICAL ERROR in weekly_events: {e}")
+        db.rollback()
         raise HTTPException(status_code=500, detail="Internal Server Error. Please contact support.")
 
 
@@ -193,32 +233,7 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
             raise HTTPException(404, detail="Event not found")
                 
 
-        event_complex = schemas.EventResponse(
-            id=str(event.id),
-            title=str(event.title),
-            description=str(event.description),
-            
-            # Club Info (Fetched via joinedload)
-            club_id=str(event.club_id),
-            club_name=event.owner.club_name if event.owner else "Unknown Club",
-            
-            # Time
-            date=event.date,
-            start_time=str(event.start_time),
-            end_time=str(event.end_time),
-            duration=float(event.duration),
-            
-            # Location
-            location_type=str(event.location_type),
-            location=str(event.location),
-            
-            # Visuals & Details
-            cover_image=str(event.cover_image),
-            tags=list(event.tags), 
-            is_registration_open=event.is_registration_open,
-            registration_link=event.registration_link,
-            capacity=event.capacity
-        )
+        event_complex = map_event_to_response(event)
 
         return schemas.SingleEventResponse(success=True, data=event_complex)
             
@@ -226,7 +241,8 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
         raise he
     
     except Exception as e:
-        print("exception: ", e)
+        logger.info("exception: %s", e)
+        db.rollback()
         raise HTTPException(400, detail=f"Exception occured in handle events: {str(e)}")
     
     
@@ -244,25 +260,17 @@ async def handle_club(club_id: str, db: Session = Depends(database.get_db)):
         club = db.execute(query).scalars().first()
     
         if not club:
-            raise HTTPException(404, detail=f"No event found with id {club_id}")
+            raise HTTPException(404, detail=f"No club found with id {club_id}")
         
-        club_data = schemas.ClubResponse(
-            id = str(club.id),
-            slug = club.slug,
-            club_name= club.club_name,
-            email = club.email,
-            description= club.description,
-            logo_url= club.logo_url,
-            banner_url= club.banner_url,
-            is_verified=bool(club.is_verified),
-            role=str(club.role),
-            rejection_reason=str(club.rejection_reason)
-        )
+        club_data = map_club_to_response(club)
         
         return schemas.ClubApiResponse(success=True, data=club_data)
             
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print("exception: ", e)
+        logger.info("exception: %s", e)
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Error occured in handle club: {str(e)}")
     
 
@@ -286,119 +294,122 @@ async def handle_club_events(club_id: str, db: Session = Depends(database.get_db
         clubs_events = []
         for event in result:
     
-            event_to_return = schemas.EventResponse(
-                id = str(event.id),
-                title = str(event.title),
-                description= str(event.description),
-                club_id=str(event.club_id),
-                club_name=event.owner.club_name if event.owner else "Unknown Club",
-                
-                # Time
-                date=event.date,
-                start_time=str(event.start_time),
-                end_time=str(event.end_time),
-                duration=float(event.duration),
-                
-                # Location
-                location_type=str(event.location_type),
-                location=str(event.location),
-                
-                # Visuals & Details
-                cover_image=str(event.cover_image),
-                tags=list(event.tags), 
-                is_registration_open=event.is_registration_open,
-                registration_link=event.registration_link,
-                capacity=event.capacity
-            )
+            event_to_return = map_event_to_response(event)
             clubs_events.append(event_to_return)
     
         return schemas.MultiEventResponse(success=True, data=clubs_events)
 
     except Exception as e:
-        print("Exception: ", e)
+        logger.info("Exception: %s", e)
+        db.rollback()
         raise HTTPException(400, detail=f"Exception occured in handle club events: {str(e)}")
 
 @api.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     try:
-        # 1. Safety Check: Does the file have a name?
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="File must have a name")
-
-        # 2. Safety Check: Is it an allowed image type?
-        # Get extension, lowercase it to match 'JPG' and 'jpg'
-        file_extension = file.filename.split(".")[-1].lower()
+        if file.content_type not in ALLOWED_CONTENT_TYPES:
+            raise HTTPException(400, detail=f"Invalid content type. Not allowed. Allowed: {list(ALLOWED_CONTENT_TYPES.keys())}")
         
-        if file_extension not in ALLOWED_EXTENSIONS:
-            raise HTTPException(status_code=400, detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}")
-
-        # 3. Generate unique name
-        unique_filename = f"{uuid.uuid4()}.{file_extension}"
-        file_location = f"uploads/{unique_filename}"
+        # 2. Generate safe filename
+        extension = ALLOWED_CONTENT_TYPES[file.content_type]
+        safe_filename = f"{secrets.token_urlsafe(16)}.{extension}"
+        file_path = Path("uploads") / safe_filename
         
-        # 4. Save the file
-        with open(file_location, "wb+") as file_object:
-            shutil.copyfileobj(file.file, file_object)
-            
-        return {"url": f"http://localhost:4444/static/{unique_filename}"}
+        # 3. Validate file size
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(413, detail=f"File too large. Maximum: {MAX_FILE_SIZE / 1024 / 1024}MB")
+        
+        # 4. Validate actual image (optional but recommended)
+        try:
+            from PIL import Image
+            import io
+            Image.open(io.BytesIO(content)).verify()
+        except Exception:
+            raise HTTPException(401, detail="Invalid image file")
+        
+        with open(file_path, "wb") as f:
+            f.write(content)
+        
+        return {"success": True, "url": f"/static/{safe_filename}"}
         
     except HTTPException as he:
         raise he # Re-raise HTTP exceptions (like thedayEvents 400s above)
+    
     except Exception as e:
-        print(f"Upload Error: {e}")
+        logger.info(f"Upload Error: {e}")
         raise HTTPException(status_code=500, detail="Image upload failed server-side")
 
 
 @api.post("/signup", response_model=schemas.UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     
-    # 1. Check if email already exists
-    # We query the DB looking for a user with this email
-    existing_user = db.query(models.User).filter_by(email=user.email).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
+    try:
+
+        # 1. Check if email already exists
+        # We query the DB looking for a user with this email
+        existing_user = db.query(models.User).filter_by(email=user.email).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        # 2. Hash the password
+        hashed_pwd = utils.hash_password(user.password)
+        
+        # 3. Create the Database Object
+        # We map the Pydantic data to the SQLAlchemy model
+        new_user = models.User(
+            email=user.email,
+            hashed_password=hashed_pwd,
+            club_name=user.club_name,
+            description=user.description
+        )
+        
+        # 4. Add & Commit
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user) # Reloads the object with the generated ID
+        
+        return schemas.UserResponse(success=True, data=new_user)
     
-    # 2. Hash the password
-    hashed_pwd = utils.hash_password(user.password)
-    
-    # 3. Create the Database Object
-    # We map the Pydantic data to the SQLAlchemy model
-    new_user = models.User(
-        email=user.email,
-        hashed_password=hashed_pwd,
-        club_name=user.club_name,
-        description=user.description
-    )
-    
-    # 4. Add & Commit
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user) # Reloads the object with the generated ID
-    
-    return new_user
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.info("Exception occured in signup: %s", e)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to create user")
 
 @api.post("/login", response_model=schemas.Token)
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(), 
     db: Session = Depends(database.get_db)
 ):
-    # 1. Find the user
-    # Note: OAuth2PasswordRequestForm expects 'username', but we treat it as 'email'
-    user = db.query(models.User).filter_by(email = form_data.username).first()
+    try:
+
+        # 1. Find the user
+        # Note: OAuth2PasswordRequestForm expects 'username', but we treat it as 'email'
+        user = db.query(models.User).filter_by(email = form_data.username).first()
+        
+        # 2. Verify User and Password
+        if not user or not utils.verify_password(form_data.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # 3. Create Token
+        access_token = utils.create_access_token(data={"sub": user.email})
+        
+        # 4. Return it
+        return {"access_token": access_token, "token_type": "bearer"}
     
-    # 2. Verify User and Password
-    if not user or not utils.verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    except HTTPException as he:
+        raise he
     
-    # 3. Create Token
-    access_token = utils.create_access_token(data={"sub": user.email})
-    
-    # 4. Return it
-    return {"access_token": access_token, "token_type": "bearer"}
+    except Exception as e:
+        logger.info("Exception occured in login: %s", e)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Server Error, failed to log in")
 
 
 # posting an event (IMPORTANT NOTE: when an event is created (with mock up auth), it doesnt show up as expected in calendar, maybe its about auth or admin)
@@ -420,7 +431,7 @@ async def create_event(
     if not bool(club.is_verified) and str(club.role) != "admin":
         raise HTTPException(
             status_code=403, 
-            detail="Your club is not verified yet. You cannot post events."
+            detail="Your club is not verified yet. You cannot post events. Unverified"
         )
     
 
@@ -431,6 +442,8 @@ async def create_event(
     # 2. Create the DB Object
     # We unpack (**dict) the Pydantic model, but we need to exclude 
     # fields that don't match the DB column names exactly if we mapped them differently
+
+    tags_string = ",".join(event_in.tags) if event_in.tags else ""
     
     db_event = models.Event(
         slug=slug,
@@ -444,7 +457,7 @@ async def create_event(
         location_type=event_in.location_type,
         location=event_in.location,
         cover_image=event_in.cover_image,
-        tags=list(event_in.tags), 
+        tags=tags_string, 
         is_registration_open=event_in.is_registration_open,
         registration_link=event_in.registration_link,
         capacity=event_in.capacity
@@ -459,24 +472,7 @@ async def create_event(
         
         # 3. Return the complex response (fetches club name automatically via relationship)
         # We re-query or just construct it manually to match the response schema
-        created_event = schemas.EventResponse(
-            id=str(db_event.id),
-            title=str(db_event.title),
-            description=str(db_event.description),
-            club_id=str(db_event.club_id),
-            club_name=db_event.owner.club_name if db_event.owner else "Loading...",
-            date=db_event.date,
-            start_time=str(db_event.start_time),
-            end_time=str(db_event.end_time),
-            duration=db_event.duration,
-            location_type=str(db_event.location_type),
-            location=str(db_event.location),
-            cover_image=str(db_event.cover_image),
-            tags=list(db_event.tags), 
-            is_registration_open=db_event.is_registration_open,
-            registration_link=db_event.registration_link,
-            capacity=db_event.capacity
-        )
+        created_event = map_event_to_response(db_event)
 
         bg_tasks.add_task(revalidate_frontend, ["events"])
 
@@ -484,7 +480,7 @@ async def create_event(
         
     except Exception as e:
         db.rollback()
-        print(f"Error creating event: {e}")
+        logger.info(f"Error creating event: {e}")
         raise HTTPException(status_code=500, detail="Could not create event")
 
 # get all clubs for the admin page and club list
@@ -503,24 +499,14 @@ async def get_all_clubs(db: Session = Depends(database.get_db)):
         
         clubs_to_return = []
         for club in result:
-            club_to_add = schemas.ClubResponse(
-                id=str(club.id),
-                slug=club.slug,
-                club_name=club.club_name,
-                email=club.email,
-                description=club.description,
-                logo_url=club.logo_url,
-                banner_url=club.banner_url,
-                is_verified=bool(club.is_verified),
-                role=str(club.role),
-                rejection_reason=str(club.rejection_reason)
-            )
+            club_to_add = map_club_to_response(club)
 
             clubs_to_return.append(club_to_add)
 
         return schemas.AllClubsResponse(success=True, data=clubs_to_return)
 
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Error getting all clubs: {e}")
 
 # club update (profile update) by admin or club owner
@@ -574,18 +560,7 @@ async def update_club(
     # 4. Return the updated club (formatted for the response schema)
     return schemas.ClubApiResponse(
         success=True,
-        data=schemas.ClubResponse(
-            id=str(club.id),
-            slug=club.slug,
-            email=club.email,
-            club_name=club.club_name,
-            description=club.description,
-            logo_url=club.logo_url,
-            banner_url=club.banner_url,
-            is_verified=bool(club.is_verified),
-            role=str(club.role),
-            rejection_reason=str(club.rejection_reason)
-        )
+        data=map_club_to_response(club)
     )
 
 # get all clubs for admin
@@ -597,36 +572,33 @@ async def get_all_clubs_admin(
     """
     Fetches ALL clubs (including unverified ones) for the Admin Dashboard.
     """
-    query = select(models.User).where(models.User.role == "club")
-    
-    if status == 'verified':
-        query = query.where(models.User.is_verified == True)
-    elif status == 'pending':
-        query = query.where(models.User.is_verified == False)
-        
-    query = query.order_by(
-        asc(models.User.is_verified), 
-        asc(models.User.club_name)
-    )
 
-    clubs = db.execute(query).scalars().all()
-    clubs_to_return = []
-    for club in clubs:
-        c = schemas.ClubResponse(
-            id=str(club.id),
-            slug=club.slug,
-            email=club.email,
-            club_name=club.club_name,
-            description=club.description,
-            logo_url=club.logo_url,
-            banner_url=club.banner_url,
-            is_verified=bool(club.is_verified),
-            role=str(club.role),
-            rejection_reason=str(club.rejection_reason)
+    try:
+
+        query = select(models.User).where(models.User.role == "club")
+        
+        if status == 'verified':
+            query = query.where(models.User.is_verified == True)
+        elif status == 'pending':
+            query = query.where(models.User.is_verified == False)
+            
+        query = query.order_by(
+            asc(models.User.is_verified), 
+            asc(models.User.club_name)
         )
-        clubs_to_return.append(c)
-    print(clubs_to_return)
-    return schemas.AllClubsResponse(success=True, data=clubs_to_return)
+    
+        clubs = db.execute(query).scalars().all()
+        clubs_to_return = []
+        for club in clubs:
+            c = map_club_to_response(club)
+            clubs_to_return.append(c)
+        #print(clubs_to_return)
+        return schemas.AllClubsResponse(success=True, data=clubs_to_return)
+    
+    except Exception as e:
+        logger.info("Exception occured in get all clubs admin: %s", e)
+        db.rollback()
+        return HTTPException(status_code=500, detail="Internal server error")
 
 
 # 1. ADMIN: SET CLUB STATUS
@@ -667,21 +639,7 @@ async def set_club_verification(
     # Return using the Wrapper (ClubApiResponse) -> Data (ClubResponse)
     return schemas.ClubApiResponse(
         success=True,
-        data=schemas.ClubResponse(
-            id=str(club.id),
-            slug=club.slug,
-            email=club.email,
-            
-            # Pass snake_case args; CamelModel handles "clubName", "logoUrl", etc.
-            club_name=club.club_name,
-            description=club.description,
-            logo_url=club.logo_url,
-            banner_url=club.banner_url,
-            
-            is_verified=club.is_verified,
-            role=club.role,
-            rejection_reason=club.rejection_reason
-        )
+        data=map_club_to_response(club)
     )
 
 
@@ -747,29 +705,7 @@ async def update_event(
     # 5. Return (Map to Schema)
     return schemas.SingleEventResponse(
         success=True,
-        data=schemas.EventResponse(
-            id=str(db_event.id),
-            
-            # Flatten club_name from the relationship
-            club_id=str(db_event.club_id),
-            club_name=club.club_name,
-            
-            title=db_event.title,
-            description=db_event.description,
-            date=db_event.date,
-            start_time=db_event.start_time,
-            end_time=db_event.end_time,
-            duration=db_event.duration,
-            location_type=db_event.location_type,
-            location=db_event.location,
-            cover_image=db_event.cover_image,
-            tags=list(db_event.tags), 
-            
-            # ✅ FIX: Use the actual values from DB (or updated values)
-            is_registration_open=db_event.is_registration_open,
-            registration_link=db_event.registration_link,
-            capacity=int(db_event.capacity) if db_event.capacity else None
-        )
+        data=map_event_to_response(db_event)
     )
 
 @api.get("/clubs", response_model=schemas.AllClubsResponse)
@@ -780,45 +716,39 @@ async def get_all_clubs_user(
     """
     Public directory of all verified clubs.
     """
-    query = db.query(models.User).filter(
-        models.User.role == "club",
-        models.User.is_verified == True
-    )
 
-    if search:
-        search_fmt = f"%{search}%"
-        query = query.filter(
-            or_(
-                models.User.club_name.ilike(search_fmt),
-                models.User.description.ilike(search_fmt)
-            )
+    try:
+
+        query = db.query(models.User).filter(
+            models.User.role == "club",
+            models.User.is_verified == True
         )
     
-    # Sort alphabetically
-    query = query.order_by(models.User.club_name.asc())
+        if search:
+            search_fmt = f"%{search}%"
+            query = query.filter(
+                or_(
+                    models.User.club_name.ilike(search_fmt),
+                    models.User.description.ilike(search_fmt)
+                )
+            )
+        
+        # Sort alphabetically
+        query = query.order_by(models.User.club_name.asc())
+        
+        clubs = query.all()
     
-    clubs = query.all()
-
-    clubs_to_return = []
-
-    for cl in clubs:
-        clubs_to_return.append(schemas.ClubResponse(
-            id=str(cl.id),
-            slug=cl.slug,
-            email=cl.email,
-            
-            # Pass snake_case args; CamelModel handles "clubName", "logoUrl", etc.
-            club_name=cl.club_name,
-            description=cl.description,
-            logo_url=cl.logo_url,
-            banner_url=cl.banner_url,
-            
-            is_verified=cl.is_verified,
-            role=cl.role,
-            rejection_reason=cl.rejection_reason
-        ))
-
-    return schemas.AllClubsResponse(success=True, data=clubs_to_return)
+        clubs_to_return = []
+    
+        for cl in clubs:
+            clubs_to_return.append(map_club_to_response(cl))
+    
+        return schemas.AllClubsResponse(success=True, data=clubs_to_return)
+    
+    except Exception as e:
+        logger.info("Exception occured in get all clubs user: %s", e)
+        db.rollback()
+        return HTTPException(500, "Internal server error getting clubs")
 
 
 if __name__ == "__main__":

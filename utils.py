@@ -1,10 +1,17 @@
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt
+import os
+from dotenv import load_dotenv
 
-SECRET_KEY = "supersecretkey_change_this_in_production"
+load_dotenv()
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
+if not SECRET_KEY or SECRET_KEY=="":
+    raise ValueError("JWT_SECRET_KEY must be set in environment variables")
+
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = os.getenv("JWT_EXPIRE_MINUTES", "60")
 
 # CHANGED: We now use "argon2" instead of "bcrypt"
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
@@ -20,7 +27,7 @@ def create_access_token(data: dict):
     to_encode = data.copy()
     
     # Set expiration time
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + timedelta(minutes=int(ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     
     # Create the JWT string

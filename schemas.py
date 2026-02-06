@@ -33,7 +33,7 @@ class UserCreate(CamelModel):
     club_name: str
     description: Optional[str] = None
 
-class UserResponse(CamelModel):
+class UserCreate2(CamelModel):
     id: str
     email: EmailStr
     club_name: str
@@ -43,6 +43,9 @@ class UserResponse(CamelModel):
     # Optional profile fields that might be empty initially
     logo_url: Optional[str] = None
     banner_url: Optional[str] = None
+class UserResponse(CamelModel):
+    success: bool
+    data: UserCreate2
 
 # --- CLUBS ---
 
@@ -70,7 +73,6 @@ class ClubStatusUpdate(CamelModel):
 
 class ClubResponse(ClubBase):
     id: str
-    slug: str
     role: str
     is_verified: bool
     rejection_reason: Optional[str] = None
