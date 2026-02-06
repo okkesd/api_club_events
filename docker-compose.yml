@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  backend:
+    image: okkesd/myapp-backend:latest
+    container_name: backend
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=sqlite:///./app.db
+      - ENVIRONMENT=production
+      - BACKEND_PORT=4444
+      - FRONTEND_URL=https://evenements.duckdns.org
+      - API_SECRET_KEY=my_super_secret_python_password
+      - NEXTJS_APP_URL=https://evenements.duckdns.org
+      - REVALIDATION_TOKEN=my_super_secret_revalidation_token
+    volumes:
+      - ./data:/app/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4444/health')"]
+      interval: 60s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    image: okkesd/myapp-frontend:latest
+    container_name: frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=/api/proxy
+      - BACKEND_URL=http://backend:4444
+      - NEXTJS_APP_URL=https://evenements.duckdns.org
+      - API_SECRET_KEY=my_super_secret_python_password
+      - REVALIDATION_KEY=my_super_secret_revalidation_token
+      - NODE_ENV=production
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  data:
