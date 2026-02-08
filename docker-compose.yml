@@ -13,6 +13,8 @@ services:
       - API_SECRET_KEY=my_super_secret_python_password
       - NEXTJS_APP_URL=https://evenements.duckdns.org
       - REVALIDATION_TOKEN=my_super_secret_revalidation_token
+      - JWT_SECRET_KEY=supersecretkey_change_this_in_production
+      - JWT_EXPIRE_MINUTES=60
     volumes:
       - ./data:/app/data
     networks:
