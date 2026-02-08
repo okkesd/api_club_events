@@ -84,3 +84,5 @@ class Event(Base):
     # Relationships
     club_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"))
     owner = relationship("User", back_populates="events")
+
+    likes: Mapped[int] = mapped_column(Integer, default=0)

@@ -101,6 +101,9 @@ class EventBase(CamelModel):
     is_registration_open: bool = False
     registration_link: Optional[str] = None
     capacity: Optional[int] = None
+    likes: int
+
+
 
 class EventCreate(EventBase):
     club_id: str
@@ -118,6 +121,7 @@ class EventUpdate(CamelModel):
     is_registration_open: Optional[bool] = None
     registration_link: Optional[str] = None
     capacity: Optional[int] = None
+    likes: Optional[int] = None
 
 class EventResponse(EventBase):
     id: str
@@ -129,3 +133,7 @@ class SingleEventResponse(ApiResponse):
 
 class MultiEventResponse(ApiResponse):
     data: List[EventResponse]
+
+class EventLikeResponse(CamelModel):
+    success: bool
+    data: Optional[EventBase] = None

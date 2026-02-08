@@ -147,7 +147,8 @@ def map_event_to_response(event: models.Event) -> schemas.EventResponse:
         tags=list(event.tags) if isinstance(event.tags, list) else [],
         is_registration_open=event.is_registration_open,
         registration_link=event.registration_link,
-        capacity=int(event.capacity) if event.capacity else None
+        capacity=int(event.capacity) if event.capacity else None,
+        likes=int(event.likes)
     )
 
 # helper
@@ -234,6 +235,7 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
                 
 
         event_complex = map_event_to_response(event)
+        logger.info(f"likes count from get events: {event_complex.likes}")
 
         return schemas.SingleEventResponse(success=True, data=event_complex)
             
@@ -749,6 +751,50 @@ async def get_all_clubs_user(
         logger.info("Exception occured in get all clubs user: %s", e)
         db.rollback()
         return HTTPException(500, "Internal server error getting clubs")
+class LikeRequest(BaseModel):
+    liked: bool
+
+
+@api.post("/event_like/{event_id}")
+async def handle_event_like(
+    event_id: str,
+    request_body: LikeRequest,
+    bg_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+):
+    try:
+        is_liked = True
+        if request_body.liked:
+            is_liked = True
+        else:
+            is_liked = False
+    
+        query = select(models.Event).where(models.Event.id == event_id)
+        event = db.execute(query).scalar()
+    
+        if not event:
+            raise HTTPException(status_code=404, detail="Event to be liked or disliked not found")
+        
+        if is_liked:
+            event.likes += 1
+        else:
+            event.likes -= 1
+
+        db.commit()
+        db.refresh(event)
+        logger.info(f"like count after handle event like: {event.likes}")
+
+        bg_tasks.add_task(revalidate_frontend, ["events"])
+
+        return schemas.EventLikeResponse(success=True, data=map_event_to_response(event))
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.info(f"Exception occured in handle_event_like for eventid = {event_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
 
 
 if __name__ == "__main__":
