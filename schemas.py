@@ -33,7 +33,7 @@ class UserCreate(CamelModel):
     club_name: str
     description: Optional[str] = None
 
-class UserResponse(CamelModel):
+class UserCreate2(CamelModel):
     id: str
     email: EmailStr
     club_name: str
@@ -43,6 +43,9 @@ class UserResponse(CamelModel):
     # Optional profile fields that might be empty initially
     logo_url: Optional[str] = None
     banner_url: Optional[str] = None
+class UserResponse(CamelModel):
+    success: bool
+    data: UserCreate2
 
 # --- CLUBS ---
 
@@ -70,7 +73,6 @@ class ClubStatusUpdate(CamelModel):
 
 class ClubResponse(ClubBase):
     id: str
-    slug: str
     role: str
     is_verified: bool
     rejection_reason: Optional[str] = None
@@ -99,6 +101,9 @@ class EventBase(CamelModel):
     is_registration_open: bool = False
     registration_link: Optional[str] = None
     capacity: Optional[int] = None
+    likes: int
+
+
 
 class EventCreate(EventBase):
     club_id: str
@@ -116,6 +121,7 @@ class EventUpdate(CamelModel):
     is_registration_open: Optional[bool] = None
     registration_link: Optional[str] = None
     capacity: Optional[int] = None
+    likes: Optional[int] = None
 
 class EventResponse(EventBase):
     id: str
@@ -127,3 +133,7 @@ class SingleEventResponse(ApiResponse):
 
 class MultiEventResponse(ApiResponse):
     data: List[EventResponse]
+
+class EventLikeResponse(CamelModel):
+    success: bool
+    data: Optional[EventBase] = None
