@@ -247,7 +247,6 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
         db.rollback()
         raise HTTPException(400, detail=f"Exception occured in handle events: {str(e)}")
     
-    
 
 # get single club
 @api.get("/clubs/{club_id}", response_model=schemas.ClubApiResponse)
@@ -275,7 +274,6 @@ async def handle_club(club_id: str, db: Session = Depends(database.get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error occured in handle club: {str(e)}")
     
-
     
 # get club's events
 @api.get("/clubs/{club_id}/events", response_model=schemas.MultiEventResponse)
@@ -306,9 +304,17 @@ async def handle_club_events(club_id: str, db: Session = Depends(database.get_db
         db.rollback()
         raise HTTPException(400, detail=f"Exception occured in handle club events: {str(e)}")
 
+# image uploading , secured
 @api.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(utils.get_current_user)
+):
     try:
+        if current_user.role not in ["club", "admin"]:
+            raise HTTPException(status_code=403, detail="Uploading image is not allowed for the user")
+
+
         if file.content_type not in ALLOWED_CONTENT_TYPES:
             raise HTTPException(400, detail=f"Invalid content type. Not allowed. Allowed: {list(ALLOWED_CONTENT_TYPES.keys())}")
         
@@ -400,7 +406,7 @@ async def login_for_access_token(
             )
         
         # 3. Create Token
-        access_token = utils.create_access_token(data={"sub": user.email})
+        access_token = utils.create_access_token(data={"sub": user.id})
         
         # 4. Return it
         return {"access_token": access_token, "token_type": "bearer"}
@@ -413,15 +419,32 @@ async def login_for_access_token(
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal Server Error, failed to log in")
 
+# after login, returns curent user
+@api.get("/users/me", response_model=schemas.UserOut)
+async def read_users_me(current_user: models.User = Depends(utils.get_current_user)):
+    """
+    Returns the currently logged-in user.
+    The 'current_user' is injected automatically by checking the JWT token.
+    """
+    return current_user
 
 # posting an event (IMPORTANT NOTE: when an event is created (with mock up auth), it doesnt show up as expected in calendar, maybe its about auth or admin)
 @api.post("/events", response_model=schemas.SingleEventResponse)
 async def create_event(
     event_in: schemas.EventCreate, 
     bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
     db: Session = Depends(database.get_db)
 ):
     
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(status_code=403, detail="Posting event is not allowed for the user")
+    
+    if current_user.role == "club":
+        if (current_user.id != event_in.club_id):
+            raise HTTPException(status_code=403, detail="You cannot post events for other clubs")
+
+
     # 1. Fetch the Club trying to post
     # (In a real app, this comes from the JWT Token. Here we look up the ID sent in the body)
     club = db.query(models.User).filter(models.User.id == event_in.club_id).first()
@@ -517,8 +540,13 @@ async def update_club(
     club_id: str, 
     club_update: schemas.ClubUpdate, 
     bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
     db: Session = Depends(database.get_db)
 ):
+    
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(status_code=403, detail="Updating a club is not allowed for the user")
+    
     # 1. Fetch the existing Club (User)
     query = select(models.User).where(models.User.id == club_id)
     club = db.execute(query).scalars().first()
@@ -569,11 +597,15 @@ async def update_club(
 @api.get("/admin/clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs_admin(
     status: Optional[str] = None, # Optional filter: 'verified', 'pending'
+    current_user: models.User = Depends(utils.get_current_user),
     db: Session = Depends(database.get_db)
 ):
     """
     Fetches ALL clubs (including unverified ones) for the Admin Dashboard.
     """
+
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Getting all clubs is not allowed for the user (club)")
 
     try:
 
@@ -609,11 +641,15 @@ async def set_club_verification(
     club_id: str,
     status_update: schemas.ClubStatusUpdate,
     bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
     db: Session = Depends(database.get_db)
 ):
     """
     Admin endpoint to Verify or Reject a club.
     """
+
+    if current_user.role != "admin":
+        raise HTTPException(status_code=401, detail="Changing club status is not allowed for the user")
     club = db.query(models.User).filter(models.User.id == club_id).first()
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
@@ -651,8 +687,13 @@ async def update_event(
     event_id: str,
     event_update: schemas.EventUpdate,
     bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
     db: Session = Depends(database.get_db)
 ):
+    
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(status_code=403, detail="Updating event is not allowed for user")
+    
     # 1. Find Event
     db_event = db.query(models.Event).filter(models.Event.id == event_id).first()
     if not db_event:

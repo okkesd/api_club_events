@@ -47,6 +47,20 @@ class UserResponse(CamelModel):
     success: bool
     data: UserCreate2
 
+class UserOut(BaseModel):
+    id: str
+    club_name: str
+    email: EmailStr
+    role: str
+    # Map DB 'is_verified' -> JSON 'isVerified'
+    is_verified: bool = Field(..., alias="isVerified") 
+    # Map DB 'avatar_url' -> JSON 'avatarUrl'
+    avatar_url: Optional[str] = Field(None, alias="avatarUrl")
+
+    class Config:
+        from_attributes = True # Was 'orm_mode = True' in Pydantic v1
+        populate_by_name = True # Allows mapping by field name
+
 # --- CLUBS ---
 
 class ClubBase(CamelModel):
