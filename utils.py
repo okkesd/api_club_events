@@ -57,6 +57,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         print(user_id)
 
         if payload.get("sub") is None:
+            print("No sub found")
             raise credentials_exception
             
     except JWTError:

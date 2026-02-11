@@ -43,6 +43,7 @@ class UserCreate2(CamelModel):
     # Optional profile fields that might be empty initially
     logo_url: Optional[str] = None
     banner_url: Optional[str] = None
+
 class UserResponse(CamelModel):
     success: bool
     data: UserCreate2
@@ -151,3 +152,16 @@ class MultiEventResponse(ApiResponse):
 class EventLikeResponse(CamelModel):
     success: bool
     data: Optional[EventBase] = None
+
+class Contact(BaseModel):
+    email: str
+    message: str
+    date: datetime.datetime
+
+class ContactRequest(BaseModel):
+    email: str
+    message: str
+
+class ContactReturn(BaseModel):
+    success: bool
+    data: Optional[List[Contact]]
