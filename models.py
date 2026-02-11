@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date, Integer
+from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date, Integer, DateTime
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from database import Base
@@ -86,3 +86,16 @@ class Event(Base):
     owner = relationship("User", back_populates="events")
 
     likes: Mapped[int] = mapped_column(Integer, default=0)
+
+class Contact(Base):
+    __tablename__ = "contact"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+
+    email: Mapped[str] = mapped_column(String)
+    message: Mapped[str] = mapped_column(String)
+
+    date : Mapped[datetime.datetime] = mapped_column(DateTime, index=True)
+
+    class Config:
+        from_attributes = True

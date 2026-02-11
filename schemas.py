@@ -43,9 +43,24 @@ class UserCreate2(CamelModel):
     # Optional profile fields that might be empty initially
     logo_url: Optional[str] = None
     banner_url: Optional[str] = None
+
 class UserResponse(CamelModel):
     success: bool
     data: UserCreate2
+
+class UserOut(BaseModel):
+    id: str
+    club_name: str
+    email: EmailStr
+    role: str
+    # Map DB 'is_verified' -> JSON 'isVerified'
+    is_verified: bool = Field(..., alias="isVerified") 
+    # Map DB 'avatar_url' -> JSON 'avatarUrl'
+    avatar_url: Optional[str] = Field(None, alias="avatarUrl")
+
+    class Config:
+        from_attributes = True # Was 'orm_mode = True' in Pydantic v1
+        populate_by_name = True # Allows mapping by field name
 
 # --- CLUBS ---
 
@@ -137,3 +152,16 @@ class MultiEventResponse(ApiResponse):
 class EventLikeResponse(CamelModel):
     success: bool
     data: Optional[EventBase] = None
+
+class Contact(BaseModel):
+    email: str
+    message: str
+    date: datetime.datetime
+
+class ContactRequest(BaseModel):
+    email: str
+    message: str
+
+class ContactReturn(BaseModel):
+    success: bool
+    data: Optional[List[Contact]]

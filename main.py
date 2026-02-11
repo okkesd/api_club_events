@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 import datetime as dt
 from sqlalchemy.orm import Session, joinedload, contains_eager
-from sqlalchemy import select, asc, desc, or_
+from sqlalchemy import select, asc, desc, or_, insert
 import time
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -217,7 +217,7 @@ async def weekly_events(
 
 # get single event
 @api.get("/events/{event_id}", response_model=schemas.SingleEventResponse)
-async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
+async def handle_events(event_id: str, db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
 
     try:
 
@@ -247,11 +247,10 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db)):
         db.rollback()
         raise HTTPException(400, detail=f"Exception occured in handle events: {str(e)}")
     
-    
 
 # get single club
 @api.get("/clubs/{club_id}", response_model=schemas.ClubApiResponse)
-async def handle_club(club_id: str, db: Session = Depends(database.get_db)):
+async def handle_club(club_id: str, db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
 
     try:
         query = (
@@ -275,7 +274,6 @@ async def handle_club(club_id: str, db: Session = Depends(database.get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error occured in handle club: {str(e)}")
     
-
     
 # get club's events
 @api.get("/clubs/{club_id}/events", response_model=schemas.MultiEventResponse)
@@ -306,9 +304,18 @@ async def handle_club_events(club_id: str, db: Session = Depends(database.get_db
         db.rollback()
         raise HTTPException(400, detail=f"Exception occured in handle club events: {str(e)}")
 
+# image uploading , secured
 @api.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(utils.get_current_user),
+    token: str = Depends(verify_api_key),
+):
     try:
+        if current_user.role not in ["club", "admin"]:
+            raise HTTPException(status_code=403, detail="Uploading image is not allowed for the user")
+
+
         if file.content_type not in ALLOWED_CONTENT_TYPES:
             raise HTTPException(400, detail=f"Invalid content type. Not allowed. Allowed: {list(ALLOWED_CONTENT_TYPES.keys())}")
         
@@ -344,7 +351,7 @@ async def upload_image(file: UploadFile = File(...)):
 
 
 @api.post("/signup", response_model=schemas.UserResponse, status_code=status.HTTP_201_CREATED)
-async def create_user(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
+async def create_user(user: schemas.UserCreate, db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
     
     try:
 
@@ -371,7 +378,7 @@ async def create_user(user: schemas.UserCreate, db: Session = Depends(database.g
         db.commit()
         db.refresh(new_user) # Reloads the object with the generated ID
         
-        return schemas.UserResponse(success=True, data=new_user)
+        return schemas.UserResponse(success=True, data=new_user) # Instead of returning this, we'd like to sign in user and login 
     
     except HTTPException as he:
         raise he
@@ -383,7 +390,8 @@ async def create_user(user: schemas.UserCreate, db: Session = Depends(database.g
 @api.post("/login", response_model=schemas.Token)
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(), 
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
     try:
 
@@ -400,7 +408,7 @@ async def login_for_access_token(
             )
         
         # 3. Create Token
-        access_token = utils.create_access_token(data={"sub": user.email})
+        access_token = utils.create_access_token(data={"sub": user.id})
         
         # 4. Return it
         return {"access_token": access_token, "token_type": "bearer"}
@@ -413,15 +421,34 @@ async def login_for_access_token(
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal Server Error, failed to log in")
 
+# after login, returns curent user
+@api.get("/users/me", response_model=schemas.UserOut)
+async def read_users_me(current_user: models.User = Depends(utils.get_current_user)):
+    """
+    Returns the currently logged-in user.
+    The 'current_user' is injected automatically by checking the JWT token.
+    """
+    return current_user
 
 # posting an event (IMPORTANT NOTE: when an event is created (with mock up auth), it doesnt show up as expected in calendar, maybe its about auth or admin)
 @api.post("/events", response_model=schemas.SingleEventResponse)
 async def create_event(
     event_in: schemas.EventCreate, 
     bg_tasks: BackgroundTasks,
-    db: Session = Depends(database.get_db)
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
+    logger.info(f"Current user's role: {current_user.role}")
+    logger.info(event_in)
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(status_code=403, detail="Posting event is not allowed for the user")
     
+    if current_user.role == "club":
+        if (current_user.id != event_in.club_id):
+            raise HTTPException(status_code=403, detail="You cannot post events for other clubs")
+
+
     # 1. Fetch the Club trying to post
     # (In a real app, this comes from the JWT Token. Here we look up the ID sent in the body)
     club = db.query(models.User).filter(models.User.id == event_in.club_id).first()
@@ -487,7 +514,7 @@ async def create_event(
 
 # get all clubs for the admin page and club list
 @api.get("/all_clubs", response_model=schemas.AllClubsResponse)
-async def get_all_clubs(db: Session = Depends(database.get_db)):
+async def get_all_clubs(db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
 
     try:
         query = (
@@ -517,8 +544,14 @@ async def update_club(
     club_id: str, 
     club_update: schemas.ClubUpdate, 
     bg_tasks: BackgroundTasks,
-    db: Session = Depends(database.get_db)
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
+    
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(status_code=403, detail="Updating a club is not allowed for the user")
+    
     # 1. Fetch the existing Club (User)
     query = select(models.User).where(models.User.id == club_id)
     club = db.execute(query).scalars().first()
@@ -569,11 +602,16 @@ async def update_club(
 @api.get("/admin/clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs_admin(
     status: Optional[str] = None, # Optional filter: 'verified', 'pending'
-    db: Session = Depends(database.get_db)
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
     """
     Fetches ALL clubs (including unverified ones) for the Admin Dashboard.
     """
+
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Getting all clubs is not allowed for the user (club)")
 
     try:
 
@@ -609,11 +647,16 @@ async def set_club_verification(
     club_id: str,
     status_update: schemas.ClubStatusUpdate,
     bg_tasks: BackgroundTasks,
-    db: Session = Depends(database.get_db)
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
     """
     Admin endpoint to Verify or Reject a club.
     """
+
+    if current_user.role != "admin":
+        raise HTTPException(status_code=401, detail="Changing club status is not allowed for the user")
     club = db.query(models.User).filter(models.User.id == club_id).first()
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
@@ -651,8 +694,14 @@ async def update_event(
     event_id: str,
     event_update: schemas.EventUpdate,
     bg_tasks: BackgroundTasks,
-    db: Session = Depends(database.get_db)
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
+    
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(status_code=403, detail="Updating event is not allowed for user")
+    
     # 1. Find Event
     db_event = db.query(models.Event).filter(models.Event.id == event_id).first()
     if not db_event:
@@ -713,7 +762,8 @@ async def update_event(
 @api.get("/clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs_user(
     search: Optional[str] = None, 
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
     """
     Public directory of all verified clubs.
@@ -761,6 +811,7 @@ async def handle_event_like(
     request_body: LikeRequest,
     bg_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
 ):
     try:
         is_liked = True
@@ -796,6 +847,65 @@ async def handle_event_like(
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
+@api.post("/contact")
+@limiter.limit("5/minute")
+async def handle_contact(
+    request: Request,
+    response: Response,
+    contact_data: schemas.ContactRequest,
+    db: Session = Depends(database.get_db),
+    #token: str = Depends(verify_api_key),
+):
+    try:
+        query = insert(models.Contact).values(email=contact_data.email, message=contact_data.message, date=datetime.now())
+        result = db.execute(query)
+        db.commit()
+
+        
+        return {"success": True}
+        
+
+    except Exception as e:
+        logger.info(f"Exception occured in handle_contact: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Server Error, please try again later")
+
+@api.get("/get_contacts")
+async def get_contacts(
+    user : models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    try:
+        if user.role != "admin":
+            raise HTTPException(status_code=403, detail="Forbidden, please don't try")
+
+        now = datetime.now()
+        a_week_ago = now - dt.timedelta(7)
+
+        query = select(models.Contact).where(models.Contact.date > a_week_ago)
+        result = db.execute(query).scalars().all()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="No contact found")
+        
+        c_to_returns = []
+        for c in result:
+            c_to_returns.append(schemas.Contact(email=c.email, message=c.message, date=c.date))
+
+        logger.info(c_to_returns)
+
+        return schemas.ContactReturn(success=True, data=c_to_returns)
+
+        
+    except HTTPException as he:
+        raise he
+
+    except Exception as e:
+        logger.info(f"Exception occured in get_contacts: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal Sever Error, please try again later")
+    
 
 if __name__ == "__main__":
 
