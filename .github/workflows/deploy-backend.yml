@@ -71,10 +71,10 @@ jobs:
             cd /home/${{ secrets.SSH_USER }}/docker-app
             
             # Pull the new backend image we just pushed
-            docker-compose pull backend
+            docker compose pull backend
             
             # Restart only the backend service
-            docker-compose up -d backend
+            docker compose up -d backend
             
             # Cleanup space
             docker image prune -f
