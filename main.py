@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
 #create api
-api = FastAPI()
+api = FastAPI() # deploy trigger
 
 # add limiter
 api.state.limiter = limiter
