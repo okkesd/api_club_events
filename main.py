@@ -31,6 +31,8 @@ models.Base.metadata.create_all(bind=database.engine)
 
 load_dotenv()
 
+# trigger deploy
+
 VALID_API_KEY = os.getenv("API_SECRET_KEY")
 NEXTJS_URL = os.getenv("NEXTJS_APP_URL", "http://localhost:3000")
 REVALIDATION_TOKEN = os.getenv("REVALIDATION_TOKEN")
