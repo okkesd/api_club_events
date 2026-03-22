@@ -4,15 +4,17 @@ services:
     container_name: backend
     restart: unless-stopped
     environment:
-      - DATABASE_URL=sqlite:///./app.db
+      - DATABASE_URL=${DATABASE_URL}
       - ENVIRONMENT=production
       - BACKEND_PORT=4444
-      - FRONTEND_URL=https://evenements.duckdns.org
-      - API_SECRET_KEY=my_super_secret_python_password
-      - NEXTJS_APP_URL=https://evenements.duckdns.org
-      - REVALIDATION_TOKEN=my_super_secret_revalidation_token
-      - JWT_SECRET_KEY=supersecretkey_change_this_in_production
-      - JWT_EXPIRE_MINUTES=60
+      - FRONTEND_URL=${FRONTEND_URL}
+      - API_SECRET_KEY=${API_SECRET_KEY}
+      - NEXTJS_APP_URL=${FRONTEND_URL}
+      - REVALIDATION_TOKEN=${REVALIDATION_TOKEN}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-60}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
     volumes:
       - ./data:/app/data
     networks:
@@ -31,9 +33,9 @@ services:
     environment:
       - NEXT_PUBLIC_API_URL=/api/proxy
       - BACKEND_URL=http://backend:4444
-      - NEXTJS_APP_URL=https://evenements.duckdns.org
-      - API_SECRET_KEY=my_super_secret_python_password
-      - REVALIDATION_KEY=my_super_secret_revalidation_token
+      - NEXTJS_APP_URL=${FRONTEND_URL}
+      - API_SECRET_KEY=${API_SECRET_KEY}
+      - REVALIDATION_KEY=${REVALIDATION_TOKEN}
       - NODE_ENV=production
     depends_on:
       backend:
