@@ -245,7 +245,7 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db), t
     except Exception as e:
         logger.info("exception: %s", e)
         db.rollback()
-        raise HTTPException(400, detail=f"Exception occured in handle events: {str(e)}")
+        raise HTTPException(500, detail="Internal server error")
     
 
 # get single club
@@ -299,10 +299,12 @@ async def handle_club_events(club_id: str, db: Session = Depends(database.get_db
     
         return schemas.MultiEventResponse(success=True, data=clubs_events)
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.info("Exception: %s", e)
         db.rollback()
-        raise HTTPException(400, detail=f"Exception occured in handle club events: {str(e)}")
+        raise HTTPException(500, detail="Internal server error")
 
 # image uploading , secured
 @api.post("/upload")
@@ -351,7 +353,8 @@ async def upload_image(
 
 
 @api.post("/signup", response_model=schemas.UserResponse, status_code=status.HTTP_201_CREATED)
-async def create_user(user: schemas.UserCreate, db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
+@limiter.limit("5/minute")
+async def create_user(request: Request, user: schemas.UserCreate, db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
     
     try:
 
@@ -388,8 +391,10 @@ async def create_user(user: schemas.UserCreate, db: Session = Depends(database.g
         raise HTTPException(status_code=500, detail="Failed to create user")
 
 @api.post("/login", response_model=schemas.Token)
+@limiter.limit("5/minute")
 async def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(), 
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(database.get_db),
     token: str = Depends(verify_api_key),
 ):
@@ -536,7 +541,7 @@ async def get_all_clubs(db: Session = Depends(database.get_db), token: str = Dep
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error getting all clubs: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # club update (profile update) by admin or club owner
 @api.patch("/clubs/{club_id}", response_model=schemas.ClubApiResponse)
@@ -590,7 +595,7 @@ async def update_club(
         bg_tasks.add_task(revalidate_frontend, ["clubs", "events"])
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update club: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update club")
 
     # 4. Return the updated club (formatted for the response schema)
     return schemas.ClubApiResponse(
@@ -638,7 +643,7 @@ async def get_all_clubs_admin(
     except Exception as e:
         logger.info("Exception occured in get all clubs admin: %s", e)
         db.rollback()
-        return HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # 1. ADMIN: SET CLUB STATUS
@@ -701,19 +706,23 @@ async def update_event(
     
     if current_user.role not in ["club", "admin"]:
         raise HTTPException(status_code=403, detail="Updating event is not allowed for user")
-    
+
     # 1. Find Event
     db_event = db.query(models.Event).filter(models.Event.id == event_id).first()
     if not db_event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    # 2. Get the Club (Owner)
+    # 2. Ownership check — clubs can only update their own events
+    if current_user.role == "club" and db_event.club_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only update your own events")
+
+    # 3. Get the Club (Owner)
     club = db.query(models.User).filter(models.User.id == db_event.club_id).first()
 
     if not club:
         raise HTTPException(status_code=500, detail="Event owner not found.")
-    
-    # 3. Permission Check
+
+    # 4. Permission Check
     if not club.is_verified and club.role != "admin":
          raise HTTPException(status_code=403, detail="Unverified clubs cannot edit events.")
 
@@ -759,6 +768,57 @@ async def update_event(
         data=map_event_to_response(db_event)
     )
 
+# DELETE EVENT
+@api.delete("/events/{event_id}", response_model=schemas.SingleEventResponse)
+async def delete_event(
+    event_id: str,
+    bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(status_code=403, detail="Deleting event is not allowed for user")
+
+    # 1. Find Event
+    db_event = (
+        db.query(models.Event)
+        .options(joinedload(models.Event.owner))
+        .filter(models.Event.id == event_id)
+        .first()
+    )
+    if not db_event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # 2. Permission Check — clubs can only delete their own events
+    if current_user.role == "club" and db_event.club_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own events")
+
+    # 3. Build response before deletion (relationship data still available)
+    event_response = map_event_to_response(db_event)
+
+    # 4. Clean up cover image file if it exists
+    if db_event.cover_image:
+        image_path = db_event.cover_image.replace("/static/", "uploads/", 1)
+        if os.path.isfile(image_path):
+            try:
+                os.remove(image_path)
+            except OSError:
+                logger.info(f"Failed to delete image file: {image_path}")
+
+    # 5. Delete from DB
+    try:
+        db.delete(db_event)
+        db.commit()
+        bg_tasks.add_task(revalidate_frontend, ["events"])
+    except Exception as e:
+        db.rollback()
+        logger.info(f"Error deleting event: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete event")
+
+    return schemas.SingleEventResponse(success=True, data=event_response)
+
+
 @api.get("/clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs_user(
     search: Optional[str] = None, 
@@ -800,7 +860,7 @@ async def get_all_clubs_user(
     except Exception as e:
         logger.info("Exception occured in get all clubs user: %s", e)
         db.rollback()
-        return HTTPException(500, "Internal server error getting clubs")
+        raise HTTPException(500, "Internal server error getting clubs")
 class LikeRequest(BaseModel):
     liked: bool
 
