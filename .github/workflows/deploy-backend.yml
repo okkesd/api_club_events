@@ -69,6 +69,18 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             cd /home/${{ secrets.SSH_USER }}/docker-app
+
+            # Write .env from GitHub Secrets
+            cat > .env << 'ENVEOF'
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            API_SECRET_KEY=${{ secrets.API_SECRET_KEY }}
+            REVALIDATION_TOKEN=${{ secrets.REVALIDATION_TOKEN }}
+            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+            JWT_EXPIRE_MINUTES=60
+            ADMIN_EMAIL=${{ secrets.ADMIN_EMAIL }}
+            ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
+            ENVEOF
             
             # Pull the new backend image we just pushed
             docker compose pull backend
