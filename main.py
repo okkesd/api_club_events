@@ -25,7 +25,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from data import club_data, event_data
-import database, models, schemas, utils
+import database, models, schemas, utils, storage
 
 models.Base.metadata.create_all(bind=database.engine)
 
@@ -71,9 +71,6 @@ api.add_middleware(
     allow_headers=["*"]
 )
 
-os.makedirs("uploads", exist_ok=True)
-
-api.mount("/static", StaticFiles(directory="uploads"), name="static")
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 ALLOWED_CONTENT_TYPES = {
@@ -319,36 +316,36 @@ async def upload_image(
         if current_user.role not in ["club", "admin"]:
             raise HTTPException(status_code=403, detail="Uploading image is not allowed for the user")
 
-
         if file.content_type not in ALLOWED_CONTENT_TYPES:
             raise HTTPException(400, detail=f"Invalid content type. Not allowed. Allowed: {list(ALLOWED_CONTENT_TYPES.keys())}")
-        
-        # 2. Generate safe filename
-        extension = ALLOWED_CONTENT_TYPES[file.content_type]
-        safe_filename = f"{secrets.token_urlsafe(16)}.{extension}"
-        file_path = Path("uploads") / safe_filename
-        
-        # 3. Validate file size
+
+        # 1. Read and validate file size
         content = await file.read()
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(413, detail=f"File too large. Maximum: {MAX_FILE_SIZE / 1024 / 1024}MB")
-        
-        # 4. Validate actual image (optional but recommended)
+
+        # 2. Validate actual image
         try:
             from PIL import Image
             import io
             Image.open(io.BytesIO(content)).verify()
         except Exception:
-            raise HTTPException(401, detail="Invalid image file")
-        
-        with open(file_path, "wb") as f:
-            f.write(content)
-        
-        return {"success": True, "url": f"/static/{safe_filename}"}
-        
+            raise HTTPException(400, detail="Invalid image file")
+
+        # 3. Compress and resize (converts to WebP)
+        compressed_bytes, ext = storage.compress_image(content)
+
+        # 4. Upload to Supabase Storage
+        safe_filename = f"{secrets.token_urlsafe(16)}.{ext}"
+        public_url = storage.upload_to_supabase(compressed_bytes, safe_filename, f"image/{ext}")
+
+        logger.info(f"Image uploaded: {safe_filename} ({len(content)} -> {len(compressed_bytes)} bytes)")
+
+        return {"success": True, "url": public_url}
+
     except HTTPException as he:
-        raise he # Re-raise HTTP exceptions (like thedayEvents 400s above)
-    
+        raise he
+
     except Exception as e:
         logger.info(f"Upload Error: {e}")
         raise HTTPException(status_code=500, detail="Image upload failed server-side")
@@ -799,14 +796,12 @@ async def delete_event(
     # 3. Build response before deletion (relationship data still available)
     event_response = map_event_to_response(db_event)
 
-    # 4. Clean up cover image file if it exists
+    # 4. Clean up cover image from Supabase Storage
     if db_event.cover_image:
-        image_path = db_event.cover_image.replace("/static/", "uploads/", 1)
-        if os.path.isfile(image_path):
-            try:
-                os.remove(image_path)
-            except OSError:
-                logger.info(f"Failed to delete image file: {image_path}")
+        try:
+            storage.delete_from_supabase(db_event.cover_image)
+        except Exception:
+            logger.info(f"Failed to delete image from storage: {db_event.cover_image}")
 
     # 5. Delete from DB
     try:
