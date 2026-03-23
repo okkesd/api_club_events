@@ -126,6 +126,7 @@ class EventBase(CamelModel):
     registration_link: Optional[str] = None
     capacity: Optional[int] = Field(None, gt=0)
     likes: int
+    view_count: int = 0
 
     @field_validator("start_time", "end_time")
     @classmethod
@@ -206,3 +207,25 @@ class ContactRequest(BaseModel):
 class ContactReturn(BaseModel):
     success: bool
     data: Optional[List[Contact]]
+
+# --- SUBSCRIPTIONS ---
+
+class SubscribeRequest(CamelModel):
+    email: EmailStr
+    club_ids: List[str] = []
+    categories: List[str] = []
+
+class SubscriptionResponse(CamelModel):
+    id: str
+    email: str
+    club_ids: List[str]
+    categories: List[str]
+    is_active: bool
+    created_at: datetime.datetime
+
+class SingleSubscriptionResponse(ApiResponse):
+    data: Optional[SubscriptionResponse] = None
+
+class MultiSubscriptionResponse(ApiResponse):
+    data: List[SubscriptionResponse]
+    pagination: Optional[PaginationMeta] = None

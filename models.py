@@ -86,6 +86,23 @@ class Event(Base):
     owner = relationship("User", back_populates="events")
 
     likes: Mapped[int] = mapped_column(Integer, default=0)
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    email: Mapped[str] = mapped_column(String, index=True)
+    token: Mapped[str] = mapped_column(String, unique=True, index=True)  # for unsubscribe link
+
+    # What they subscribe to (comma-separated club IDs and/or category keywords)
+    club_ids: Mapped[str] = mapped_column(Text, default="")  # comma-separated club UUIDs
+    categories: Mapped[str] = mapped_column(Text, default="")  # comma-separated: "workshop,social,career"
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, index=True)
+
 
 class Contact(Base):
     __tablename__ = "contact"
