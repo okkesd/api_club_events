@@ -16,7 +16,8 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 import datetime as dt
 from sqlalchemy.orm import Session, joinedload, contains_eager
-from sqlalchemy import select, asc, desc, or_, insert
+from sqlalchemy import select, asc, desc, or_, insert, func
+import math
 import time
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -141,7 +142,7 @@ def map_event_to_response(event: models.Event) -> schemas.EventResponse:
         location_type=event.location_type,
         location=event.location,
         cover_image=event.cover_image,
-        tags=list(event.tags) if isinstance(event.tags, list) else [],
+        tags=[t.strip() for t in event.tags.split(",") if t.strip()] if event.tags else [],
         is_registration_open=event.is_registration_open,
         registration_link=event.registration_link,
         capacity=int(event.capacity) if event.capacity else None,
@@ -164,6 +165,17 @@ def map_club_to_response(club: models.User) -> schemas.ClubResponse:
         )
 
 
+# helper
+def paginate(page: int, page_size: int, total: Optional[int]) -> schemas.PaginationMeta:
+    total = total or 0
+    return schemas.PaginationMeta(
+        page=page,
+        page_size=page_size,
+        total=total,
+        total_pages=math.ceil(total / page_size) if page_size > 0 else 0,
+    )
+
+
 @api.get("/health")
 async def health_check():
     return {"status": "healthy"}
@@ -172,36 +184,41 @@ async def health_check():
 @api.get("/events/weekly", response_model=schemas.MultiEventResponse)
 @limiter.limit("10/minute") # Only 10 requests allowed per IP per minute
 async def weekly_events(
-    request: Request,  
+    request: Request,
     response: Response,
-    date: str = Query(..., description="Any date within the desired week (YYYY-MM-DD)"), 
-    db: Session = Depends(database.get_db), 
+    date: str = Query(..., description="Any date within the desired week (YYYY-MM-DD)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(database.get_db),
     token: str = Depends(verify_api_key),
 ):
-    
+
     try:
         week_beginning, week_end = get_week_range(date)
-    
-        get_weekly_events_query = (select(models.Event)
-                                    .join(models.Event.owner)
-                                    .options(contains_eager(models.Event.owner))
-                                    .where(models.Event.date >= week_beginning.date())
-                                    .where(models.Event.date < week_end.date())
-                                    .order_by(models.Event.date.asc())
-                                )
-        result = db.execute(get_weekly_events_query)
-    
-        db_events = result.scalars().unique().all()
 
-        data_to_send = []
-        
-        for event in db_events:
-            
-            event_dto = map_event_to_response(event)
-            data_to_send.append(event_dto)
+        base_filter = (
+            select(models.Event)
+            .where(models.Event.date >= week_beginning.date())
+            .where(models.Event.date < week_end.date())
+        )
 
-        # ✅ Correct Return Type: MultiEventResponse (for lists)
-        return schemas.MultiEventResponse(success=True, data=data_to_send)
+        total = db.execute(select(func.count()).select_from(base_filter.subquery())).scalar()
+
+        query = (
+            base_filter
+            .join(models.Event.owner)
+            .options(contains_eager(models.Event.owner))
+            .order_by(models.Event.date.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        db_events = db.execute(query).scalars().unique().all()
+
+        data_to_send = [map_event_to_response(event) for event in db_events]
+
+        return schemas.MultiEventResponse(
+            success=True, data=data_to_send, pagination=paginate(page, page_size, total)
+        )
 
     except HTTPException as he:
         raise he
@@ -210,6 +227,68 @@ async def weekly_events(
         logger.info(f"❌ CRITICAL ERROR in weekly_events: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal Server Error. Please contact support.")
+
+
+# browse/search events
+@api.get("/events", response_model=schemas.MultiEventResponse)
+async def browse_events(
+    search: Optional[str] = None,
+    tag: Optional[str] = None,
+    location_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    club_id: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    try:
+        base_query = select(models.Event)
+
+        if search:
+            search_fmt = f"%{search}%"
+            base_query = base_query.where(
+                or_(
+                    models.Event.title.ilike(search_fmt),
+                    models.Event.description.ilike(search_fmt),
+                )
+            )
+        if tag:
+            base_query = base_query.where(models.Event.tags.ilike(f"%{tag}%"))
+        if location_type:
+            base_query = base_query.where(models.Event.location_type == location_type)
+        if club_id:
+            base_query = base_query.where(models.Event.club_id == club_id)
+        if date_from:
+            base_query = base_query.where(models.Event.date >= date_from)
+        if date_to:
+            base_query = base_query.where(models.Event.date <= date_to)
+
+        total = db.execute(select(func.count()).select_from(base_query.subquery())).scalar()
+
+        query = (
+            base_query
+            .join(models.Event.owner)
+            .options(contains_eager(models.Event.owner))
+            .order_by(models.Event.date.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        db_events = db.execute(query).scalars().unique().all()
+
+        data = [map_event_to_response(event) for event in db_events]
+
+        return schemas.MultiEventResponse(
+            success=True, data=data, pagination=paginate(page, page_size, total)
+        )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.info(f"Error in browse_events: {e}")
+        db.rollback()
+        raise HTTPException(500, detail="Internal server error")
 
 
 # get single event
@@ -274,27 +353,31 @@ async def handle_club(club_id: str, db: Session = Depends(database.get_db), toke
     
 # get club's events
 @api.get("/clubs/{club_id}/events", response_model=schemas.MultiEventResponse)
-async def handle_club_events(club_id: str, db: Session = Depends(database.get_db)):
+async def handle_club_events(
+    club_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(database.get_db),
+):
 
     try:
+        base_filter = select(models.Event).where(models.Event.club_id == club_id)
+        total = db.execute(select(func.count()).select_from(base_filter.subquery())).scalar()
+
         query = (
-            select(models.Event)
+            base_filter
             .options(joinedload(models.Event.owner))
-            .where(models.Event.club_id == club_id)
+            .order_by(models.Event.date.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
-    
         result = db.execute(query).scalars().unique().all()
-    
-        if not result:
-            raise HTTPException(status_code=404, detail="No event found")
-        
-        clubs_events = []
-        for event in result:
-    
-            event_to_return = map_event_to_response(event)
-            clubs_events.append(event_to_return)
-    
-        return schemas.MultiEventResponse(success=True, data=clubs_events)
+
+        clubs_events = [map_event_to_response(event) for event in result]
+
+        return schemas.MultiEventResponse(
+            success=True, data=clubs_events, pagination=paginate(page, page_size, total)
+        )
 
     except HTTPException as he:
         raise he
@@ -305,7 +388,9 @@ async def handle_club_events(club_id: str, db: Session = Depends(database.get_db
 
 # image uploading , secured
 @api.post("/upload")
+@limiter.limit("10/minute")
 async def upload_image(
+    request: Request,
     file: UploadFile = File(...),
     current_user: models.User = Depends(utils.get_current_user),
     token: str = Depends(verify_api_key),
@@ -516,25 +601,25 @@ async def create_event(
 
 # get all clubs for the admin page and club list
 @api.get("/all_clubs", response_model=schemas.AllClubsResponse)
-async def get_all_clubs(db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
+async def get_all_clubs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
 
     try:
-        query = (
-            select(models.User)
+        total = db.execute(select(func.count()).select_from(models.User)).scalar()
+
+        result = db.execute(
+            select(models.User).offset((page - 1) * page_size).limit(page_size)
+        ).scalars().all()
+
+        clubs_to_return = [map_club_to_response(club) for club in result]
+
+        return schemas.AllClubsResponse(
+            success=True, data=clubs_to_return, pagination=paginate(page, page_size, total)
         )
-
-        result = db.execute(query).scalars().all()
-
-        if not result:
-            raise HTTPException(status_code=404, detail="No club found")
-        
-        clubs_to_return = []
-        for club in result:
-            club_to_add = map_club_to_response(club)
-
-            clubs_to_return.append(club_to_add)
-
-        return schemas.AllClubsResponse(success=True, data=clubs_to_return)
 
     except Exception as e:
         db.rollback()
@@ -603,7 +688,9 @@ async def update_club(
 # get all clubs for admin
 @api.get("/admin/clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs_admin(
-    status: Optional[str] = None, # Optional filter: 'verified', 'pending'
+    status: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     current_user: models.User = Depends(utils.get_current_user),
     db: Session = Depends(database.get_db),
     token: str = Depends(verify_api_key),
@@ -617,25 +704,26 @@ async def get_all_clubs_admin(
 
     try:
 
-        query = select(models.User).where(models.User.role == "club")
-        
+        base_query = select(models.User).where(models.User.role == "club")
+
         if status == 'verified':
-            query = query.where(models.User.is_verified == True)
+            base_query = base_query.where(models.User.is_verified == True)
         elif status == 'pending':
-            query = query.where(models.User.is_verified == False)
-            
-        query = query.order_by(
-            asc(models.User.is_verified), 
+            base_query = base_query.where(models.User.is_verified == False)
+
+        total = db.execute(select(func.count()).select_from(base_query.subquery())).scalar()
+
+        query = base_query.order_by(
+            asc(models.User.is_verified),
             asc(models.User.club_name)
-        )
-    
+        ).offset((page - 1) * page_size).limit(page_size)
+
         clubs = db.execute(query).scalars().all()
-        clubs_to_return = []
-        for club in clubs:
-            c = map_club_to_response(club)
-            clubs_to_return.append(c)
-        #print(clubs_to_return)
-        return schemas.AllClubsResponse(success=True, data=clubs_to_return)
+        clubs_to_return = [map_club_to_response(club) for club in clubs]
+
+        return schemas.AllClubsResponse(
+            success=True, data=clubs_to_return, pagination=paginate(page, page_size, total)
+        )
     
     except Exception as e:
         logger.info("Exception occured in get all clubs admin: %s", e)
@@ -816,7 +904,9 @@ async def delete_event(
 
 @api.get("/clubs", response_model=schemas.AllClubsResponse)
 async def get_all_clubs_user(
-    search: Optional[str] = None, 
+    search: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(database.get_db),
     token: str = Depends(verify_api_key),
 ):
@@ -826,31 +916,30 @@ async def get_all_clubs_user(
 
     try:
 
-        query = db.query(models.User).filter(
+        base_query = select(models.User).where(
             models.User.role == "club",
             models.User.is_verified == True
         )
-    
+
         if search:
             search_fmt = f"%{search}%"
-            query = query.filter(
+            base_query = base_query.where(
                 or_(
                     models.User.club_name.ilike(search_fmt),
                     models.User.description.ilike(search_fmt)
                 )
             )
-        
-        # Sort alphabetically
-        query = query.order_by(models.User.club_name.asc())
-        
-        clubs = query.all()
-    
-        clubs_to_return = []
-    
-        for cl in clubs:
-            clubs_to_return.append(map_club_to_response(cl))
-    
-        return schemas.AllClubsResponse(success=True, data=clubs_to_return)
+
+        total = db.execute(select(func.count()).select_from(base_query.subquery())).scalar()
+
+        query = base_query.order_by(models.User.club_name.asc()).offset((page - 1) * page_size).limit(page_size)
+        clubs = db.execute(query).scalars().all()
+
+        clubs_to_return = [map_club_to_response(cl) for cl in clubs]
+
+        return schemas.AllClubsResponse(
+            success=True, data=clubs_to_return, pagination=paginate(page, page_size, total)
+        )
     
     except Exception as e:
         logger.info("Exception occured in get all clubs user: %s", e)
@@ -884,7 +973,7 @@ async def handle_event_like(
         if is_liked:
             event.likes += 1
         else:
-            event.likes -= 1
+            event.likes = max(0, event.likes - 1)
 
         db.commit()
         db.refresh(event)

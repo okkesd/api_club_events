@@ -1,6 +1,8 @@
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 from typing import Optional, List
 import datetime
+import re
+import math
 
 # --- BASE CONFIG ---
 class CamelModel(BaseModel):
@@ -20,6 +22,12 @@ class CamelModel(BaseModel):
 class ApiResponse(CamelModel):
     success: bool
     error_msg: Optional[str] = None
+
+class PaginationMeta(CamelModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
 
 # --- AUTH & USERS ---
 
@@ -97,46 +105,78 @@ class ClubApiResponse(ApiResponse):
 
 class AllClubsResponse(ApiResponse):
     data: List[ClubResponse]
+    pagination: Optional[PaginationMeta] = None
 
 # --- EVENTS ---
 
 class EventBase(CamelModel):
-    title: str
-    description: str
-    date: datetime.date  # Pydantic handles "YYYY-MM-DD" string -> date obj conversion
+    title: str = Field(..., max_length=200)
+    description: str = Field(..., max_length=5000)
+    date: datetime.date
     start_time: str
     end_time: str
-    duration: float
+    duration: float = Field(..., gt=0)
     location_type: str
-    location: str
+    location: str = Field(..., max_length=500)
     cover_image: Optional[str] = None
     tags: List[str] = []
-    
+
     # Registration Logic
     is_registration_open: bool = False
     registration_link: Optional[str] = None
-    capacity: Optional[int] = None
+    capacity: Optional[int] = Field(None, gt=0)
     likes: int
 
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        if not re.match(r"^\d{2}:\d{2}$", v):
+            raise ValueError("Time must be in HH:MM format")
+        h, m = map(int, v.split(":"))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("Invalid time value")
+        return v
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, v: List[str]) -> List[str]:
+        if len(v) > 10:
+            raise ValueError("Maximum 10 tags allowed")
+        for tag in v:
+            if len(tag) > 50:
+                raise ValueError(f"Tag '{tag[:20]}...' exceeds 50 characters")
+        return v
 
 
 class EventCreate(EventBase):
     club_id: str
 
 class EventUpdate(CamelModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
+    title: Optional[str] = Field(None, max_length=200)
+    description: Optional[str] = Field(None, max_length=5000)
     date: Optional[datetime.date] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
-    duration: Optional[float] = None
+    duration: Optional[float] = Field(None, gt=0)
     location_type: Optional[str] = None
-    location: Optional[str] = None
+    location: Optional[str] = Field(None, max_length=500)
     cover_image: Optional[str] = None
     is_registration_open: Optional[bool] = None
     registration_link: Optional[str] = None
-    capacity: Optional[int] = None
+    capacity: Optional[int] = Field(None, gt=0)
     likes: Optional[int] = None
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_format(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not re.match(r"^\d{2}:\d{2}$", v):
+            raise ValueError("Time must be in HH:MM format")
+        h, m = map(int, v.split(":"))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("Invalid time value")
+        return v
 
 class EventResponse(EventBase):
     id: str
@@ -148,6 +188,7 @@ class SingleEventResponse(ApiResponse):
 
 class MultiEventResponse(ApiResponse):
     data: List[EventResponse]
+    pagination: Optional[PaginationMeta] = None
 
 class EventLikeResponse(CamelModel):
     success: bool
@@ -159,8 +200,8 @@ class Contact(BaseModel):
     date: datetime.datetime
 
 class ContactRequest(BaseModel):
-    email: str
-    message: str
+    email: EmailStr
+    message: str = Field(..., max_length=2000)
 
 class ContactReturn(BaseModel):
     success: bool
