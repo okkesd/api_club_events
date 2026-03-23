@@ -15,8 +15,9 @@ services:
       - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-60}
       - ADMIN_EMAIL=${ADMIN_EMAIL}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
-    volumes:
-      - ./data:/app/data
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - STORAGE_BUCKET=${STORAGE_BUCKET:-event-images}
     networks:
       - app-network
     healthcheck:
@@ -70,5 +71,3 @@ networks:
   app-network:
     driver: bridge
 
-volumes:
-  data:
