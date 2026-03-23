@@ -153,6 +153,46 @@ class EventLikeResponse(CamelModel):
     success: bool
     data: Optional[EventBase] = None
 
+# --- ANNOUNCEMENTS ---
+
+class AnnouncementBase(CamelModel):
+    title: str
+    body: str
+    cover_image: Optional[str] = None
+    link: Optional[str] = None
+    tags: List[str] = []
+    category: str = "general"
+    is_pinned: bool = False
+    expires_at: Optional[datetime.date] = None
+
+class AnnouncementCreate(AnnouncementBase):
+    club_id: str
+
+class AnnouncementUpdate(CamelModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    cover_image: Optional[str] = None
+    link: Optional[str] = None
+    tags: Optional[List[str]] = None
+    category: Optional[str] = None
+    is_pinned: Optional[bool] = None
+    expires_at: Optional[datetime.date] = None
+
+class AnnouncementResponse(AnnouncementBase):
+    id: str
+    club_id: str
+    club_name: str
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+
+class SingleAnnouncementResponse(ApiResponse):
+    data: Optional[AnnouncementResponse] = None
+
+class MultiAnnouncementResponse(ApiResponse):
+    data: List[AnnouncementResponse]
+
+# --- CONTACT ---
+
 class Contact(BaseModel):
     email: str
     message: str

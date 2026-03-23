@@ -902,6 +902,259 @@ async def handle_event_like(
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
+# ==================== ANNOUNCEMENTS ====================
+
+def map_announcement_to_response(a: models.Announcement) -> schemas.AnnouncementResponse:
+    return schemas.AnnouncementResponse(
+        id=str(a.id),
+        club_id=str(a.club_id),
+        club_name=a.owner.club_name if a.owner else "Unknown",
+        title=a.title,
+        body=a.body,
+        cover_image=a.cover_image,
+        link=a.link,
+        tags=list(a.tags.split(",")) if a.tags else [],
+        category=a.category,
+        is_pinned=bool(a.is_pinned),
+        expires_at=a.expires_at,
+        created_at=a.created_at,
+        updated_at=a.updated_at,
+    )
+
+
+@api.get("/announcements", response_model=schemas.MultiAnnouncementResponse)
+async def get_announcements(
+    category: Optional[str] = None,
+    club_id: Optional[str] = None,
+    tag: Optional[str] = None,
+    search: Optional[str] = None,
+    include_expired: bool = False,
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    try:
+        query = (
+            select(models.Announcement)
+            .join(models.Announcement.owner)
+            .options(contains_eager(models.Announcement.owner))
+        )
+
+        if category:
+            query = query.where(models.Announcement.category == category)
+        if club_id:
+            query = query.where(models.Announcement.club_id == club_id)
+        if tag:
+            query = query.where(models.Announcement.tags.ilike(f"%{tag}%"))
+        if search:
+            search_fmt = f"%{search}%"
+            query = query.where(
+                or_(
+                    models.Announcement.title.ilike(search_fmt),
+                    models.Announcement.body.ilike(search_fmt),
+                )
+            )
+        if not include_expired:
+            query = query.where(
+                or_(
+                    models.Announcement.expires_at.is_(None),
+                    models.Announcement.expires_at >= datetime.now().date(),
+                )
+            )
+
+        # Pinned first, then newest
+        query = query.order_by(
+            models.Announcement.is_pinned.desc(),
+            models.Announcement.created_at.desc(),
+        )
+
+        result = db.execute(query).scalars().unique().all()
+
+        return schemas.MultiAnnouncementResponse(
+            success=True,
+            data=[map_announcement_to_response(a) for a in result],
+        )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.info(f"Error fetching announcements: {e}")
+        db.rollback()
+        raise HTTPException(500, detail="Internal server error")
+
+
+@api.get("/announcements/{announcement_id}", response_model=schemas.SingleAnnouncementResponse)
+async def get_announcement(
+    announcement_id: str,
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    try:
+        query = (
+            select(models.Announcement)
+            .options(joinedload(models.Announcement.owner))
+            .where(models.Announcement.id == announcement_id)
+        )
+        a = db.execute(query).scalars().first()
+
+        if not a:
+            raise HTTPException(404, detail="Announcement not found")
+
+        return schemas.SingleAnnouncementResponse(
+            success=True, data=map_announcement_to_response(a)
+        )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.info(f"Error fetching announcement: {e}")
+        db.rollback()
+        raise HTTPException(500, detail="Internal server error")
+
+
+@api.post("/announcements", response_model=schemas.SingleAnnouncementResponse)
+async def create_announcement(
+    announcement_in: schemas.AnnouncementCreate,
+    bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(403, detail="Posting announcements is not allowed for this user")
+
+    if current_user.role == "club" and current_user.id != announcement_in.club_id:
+        raise HTTPException(403, detail="You cannot post announcements for other clubs")
+
+    club = db.query(models.User).filter(models.User.id == announcement_in.club_id).first()
+    if not club:
+        raise HTTPException(404, detail="Club not found")
+
+    if not bool(club.is_verified) and str(club.role) != "admin":
+        raise HTTPException(403, detail="Unverified clubs cannot post announcements")
+
+    slug = models.generate_slug(f"{announcement_in.title} {datetime.now().strftime('%Y%m%d%H%M')}")
+    tags_string = ",".join(announcement_in.tags) if announcement_in.tags else ""
+
+    db_announcement = models.Announcement(
+        slug=slug,
+        title=announcement_in.title,
+        body=announcement_in.body,
+        cover_image=announcement_in.cover_image,
+        link=announcement_in.link,
+        tags=tags_string,
+        category=announcement_in.category,
+        is_pinned=announcement_in.is_pinned if current_user.role == "admin" else False,
+        expires_at=announcement_in.expires_at,
+        club_id=announcement_in.club_id,
+    )
+
+    try:
+        db.add(db_announcement)
+        db.commit()
+        db.refresh(db_announcement)
+
+        bg_tasks.add_task(revalidate_frontend, ["announcements"])
+
+        return schemas.SingleAnnouncementResponse(
+            success=True, data=map_announcement_to_response(db_announcement)
+        )
+
+    except Exception as e:
+        db.rollback()
+        logger.info(f"Error creating announcement: {e}")
+        raise HTTPException(500, detail="Could not create announcement")
+
+
+@api.patch("/announcements/{announcement_id}", response_model=schemas.SingleAnnouncementResponse)
+async def update_announcement(
+    announcement_id: str,
+    update: schemas.AnnouncementUpdate,
+    bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(403, detail="Updating announcements is not allowed for this user")
+
+    db_a = db.query(models.Announcement).filter(models.Announcement.id == announcement_id).first()
+    if not db_a:
+        raise HTTPException(404, detail="Announcement not found")
+
+    if current_user.role == "club" and db_a.club_id != current_user.id:
+        raise HTTPException(403, detail="You can only update your own announcements")
+
+    if update.title is not None: db_a.title = update.title
+    if update.body is not None: db_a.body = update.body
+    if update.cover_image is not None: db_a.cover_image = update.cover_image
+    if update.link is not None: db_a.link = update.link
+    if update.tags is not None: db_a.tags = ",".join(update.tags)
+    if update.category is not None: db_a.category = update.category
+    if update.expires_at is not None: db_a.expires_at = update.expires_at
+
+    # Only admin can pin
+    if update.is_pinned is not None and current_user.role == "admin":
+        db_a.is_pinned = update.is_pinned
+
+    try:
+        db.commit()
+        db.refresh(db_a)
+        bg_tasks.add_task(revalidate_frontend, ["announcements"])
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, detail="Failed to update announcement")
+
+    return schemas.SingleAnnouncementResponse(
+        success=True, data=map_announcement_to_response(db_a)
+    )
+
+
+@api.delete("/announcements/{announcement_id}", response_model=schemas.SingleAnnouncementResponse)
+async def delete_announcement(
+    announcement_id: str,
+    bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    if current_user.role not in ["club", "admin"]:
+        raise HTTPException(403, detail="Deleting announcements is not allowed for this user")
+
+    db_a = (
+        db.query(models.Announcement)
+        .options(joinedload(models.Announcement.owner))
+        .filter(models.Announcement.id == announcement_id)
+        .first()
+    )
+    if not db_a:
+        raise HTTPException(404, detail="Announcement not found")
+
+    if current_user.role == "club" and db_a.club_id != current_user.id:
+        raise HTTPException(403, detail="You can only delete your own announcements")
+
+    response = map_announcement_to_response(db_a)
+
+    # Clean up cover image from Supabase Storage
+    if db_a.cover_image:
+        try:
+            storage.delete_from_supabase(db_a.cover_image)
+        except Exception:
+            logger.info(f"Failed to delete announcement image: {db_a.cover_image}")
+
+    try:
+        db.delete(db_a)
+        db.commit()
+        bg_tasks.add_task(revalidate_frontend, ["announcements"])
+    except Exception as e:
+        db.rollback()
+        logger.info(f"Error deleting announcement: {e}")
+        raise HTTPException(500, detail="Failed to delete announcement")
+
+    return schemas.SingleAnnouncementResponse(success=True, data=response)
+
+
+# ==================== CONTACT ====================
+
 @api.post("/contact")
 @limiter.limit("5/minute")
 async def handle_contact(
