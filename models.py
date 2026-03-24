@@ -12,6 +12,16 @@ class LocationType(str, Enum):
     ON_CAMPUS = "on-campus"
     OFF_CAMPUS = "off-campus"
 
+class AnnouncementCategory(str, Enum):
+    INTERNSHIP = "internship"
+    JOB = "job"
+    SCHOLARSHIP = "scholarship"
+    COMPETITION = "competition"
+    RECRUITMENT = "recruitment"
+    ACADEMIC = "academic"
+    WORKSHOP = "workshop"
+    GENERAL = "general"
+
 class UserRole(str, Enum):
     CLUB = "club"
     ADMIN = "admin"
@@ -50,6 +60,7 @@ class User(Base):
     
     # Relationships
     events = relationship("Event", back_populates="owner", cascade="all, delete-orphan")
+    announcements = relationship("Announcement", back_populates="owner", cascade="all, delete-orphan")
 
 class Event(Base):
     __tablename__ = "events"
@@ -86,6 +97,37 @@ class Event(Base):
     owner = relationship("User", back_populates="events")
 
     likes: Mapped[int] = mapped_column(Integer, default=0)
+
+class Announcement(Base):
+    __tablename__ = "announcements"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    slug: Mapped[str] = mapped_column(String, unique=True, index=True)
+
+    # Content
+    title: Mapped[str] = mapped_column(String, index=True)
+    body: Mapped[str] = mapped_column(Text)
+    cover_image: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    link: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    tags: Mapped[str] = mapped_column(String, default="")
+    category: Mapped[str] = mapped_column(
+        SQLEnum(AnnouncementCategory),
+        nullable=False,
+        default=AnnouncementCategory.GENERAL
+    )
+
+    # Visibility
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    expires_at: Mapped[Optional[datetime.date]] = mapped_column(Date, nullable=True, index=True)
+
+    # Timestamps
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, index=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    # Relationships
+    club_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"))
+    owner = relationship("User", back_populates="announcements")
+
 
 class Contact(Base):
     __tablename__ = "contact"
