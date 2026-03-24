@@ -126,8 +126,15 @@ def revalidate_frontend(tags: list[str]):
     except Exception as e:
         logger.info(f"❌ Error triggering revalidation: {e}")
 
+# helper — extract client IP from X-Forwarded-For or fall back to request.client
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 # helper
-def map_event_to_response(event: models.Event) -> schemas.EventResponse:
+def map_event_to_response(event: models.Event, has_liked: bool = False) -> schemas.EventResponse:
     """Convert Event model to EventResponse schema."""
     return schemas.EventResponse(
         id=str(event.id),
@@ -148,6 +155,7 @@ def map_event_to_response(event: models.Event) -> schemas.EventResponse:
         capacity=int(event.capacity) if event.capacity else None,
         likes=int(event.likes),
         view_count=int(event.view_count),
+        has_liked=has_liked,
     )
 
 # helper
@@ -294,7 +302,7 @@ async def browse_events(
 
 # get single event
 @api.get("/events/{event_id}", response_model=schemas.SingleEventResponse)
-async def handle_events(event_id: str, db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
+async def handle_events(event_id: str, request: Request, db: Session = Depends(database.get_db), token: str = Depends(verify_api_key),):
 
     try:
 
@@ -306,7 +314,7 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db), t
 
         res = db.execute(query)
         event = res.scalars().first()
-        
+
         if not event:
             raise HTTPException(404, detail="Event not found")
 
@@ -314,7 +322,16 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db), t
         event.view_count += 1
         db.commit()
 
-        event_complex = map_event_to_response(event)
+        # Check if this IP has liked the event
+        client_ip = get_client_ip(request)
+        has_liked = db.execute(
+            select(models.EventLike).where(
+                models.EventLike.event_id == event_id,
+                models.EventLike.ip_address == client_ip,
+            )
+        ).scalar() is not None
+
+        event_complex = map_event_to_response(event, has_liked=has_liked)
 
         return schemas.SingleEventResponse(success=True, data=event_complex)
             
@@ -948,48 +965,56 @@ async def get_all_clubs_user(
         logger.info("Exception occured in get all clubs user: %s", e)
         db.rollback()
         raise HTTPException(500, "Internal server error getting clubs")
-class LikeRequest(BaseModel):
-    liked: bool
-
-
-@api.post("/event_like/{event_id}")
+@api.post("/event_like/{event_id}", response_model=schemas.EventLikeResponse)
 async def handle_event_like(
     event_id: str,
-    request_body: LikeRequest,
+    request: Request,
     bg_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db),
     token: str = Depends(verify_api_key),
 ):
     try:
-        is_liked = True
-        if request_body.liked:
-            is_liked = True
-        else:
-            is_liked = False
-    
-        query = select(models.Event).where(models.Event.id == event_id)
-        event = db.execute(query).scalar()
-    
+        client_ip = get_client_ip(request)
+
+        event = db.execute(
+            select(models.Event).where(models.Event.id == event_id)
+        ).scalar()
+
         if not event:
-            raise HTTPException(status_code=404, detail="Event to be liked or disliked not found")
-        
-        if is_liked:
-            event.likes += 1
-        else:
+            raise HTTPException(status_code=404, detail="Event not found")
+
+        # Check if this IP already liked this event
+        existing_like = db.execute(
+            select(models.EventLike).where(
+                models.EventLike.event_id == event_id,
+                models.EventLike.ip_address == client_ip,
+            )
+        ).scalar()
+
+        if existing_like:
+            # Unlike — remove the row and decrement
+            db.delete(existing_like)
             event.likes = max(0, event.likes - 1)
+            has_liked = False
+        else:
+            # Like — insert row and increment
+            new_like = models.EventLike(event_id=event_id, ip_address=client_ip)
+            db.add(new_like)
+            event.likes += 1
+            has_liked = True
 
         db.commit()
         db.refresh(event)
-        logger.info(f"like count after handle event like: {event.likes}")
+        logger.info(f"like toggle: event={event_id} ip={client_ip} liked={has_liked} total={event.likes}")
 
         bg_tasks.add_task(revalidate_frontend, ["events"])
 
-        return schemas.EventLikeResponse(success=True, data=map_event_to_response(event))
-        
+        return schemas.EventLikeResponse(success=True, likes=int(event.likes), has_liked=has_liked)
+
     except HTTPException as he:
         raise he
     except Exception as e:
-        logger.info(f"Exception occured in handle_event_like for eventid = {event_id}: {e}")
+        logger.info(f"Exception in handle_event_like for event {event_id}: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Internal Server Error")
 

@@ -183,6 +183,7 @@ class EventResponse(EventBase):
     id: str
     club_id: str
     club_name: str  # Flattened from relation for easy UI access
+    has_liked: bool = False
 
 class SingleEventResponse(ApiResponse):
     data: Optional[EventResponse] = None
@@ -193,7 +194,8 @@ class MultiEventResponse(ApiResponse):
 
 class EventLikeResponse(CamelModel):
     success: bool
-    data: Optional[EventBase] = None
+    likes: int
+    has_liked: bool
 
 # --- ANNOUNCEMENTS ---
 

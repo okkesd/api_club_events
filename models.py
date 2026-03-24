@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date, Integer, DateTime
+from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date, Integer, DateTime, UniqueConstraint
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from database import Base
@@ -98,6 +98,23 @@ class Event(Base):
 
     likes: Mapped[int] = mapped_column(Integer, default=0)
     view_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Relationships
+    event_likes = relationship("EventLike", back_populates="event", cascade="all, delete-orphan")
+
+
+class EventLike(Base):
+    __tablename__ = "event_likes"
+    __table_args__ = (
+        UniqueConstraint("event_id", "ip_address", name="uq_event_ip"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    event_id: Mapped[str] = mapped_column(String, ForeignKey("events.id", ondelete="CASCADE"))
+    ip_address: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+
+    event = relationship("Event", back_populates="event_likes")
 
 
 class Subscription(Base):
