@@ -146,7 +146,8 @@ def map_event_to_response(event: models.Event) -> schemas.EventResponse:
         is_registration_open=event.is_registration_open,
         registration_link=event.registration_link,
         capacity=int(event.capacity) if event.capacity else None,
-        likes=int(event.likes)
+        likes=int(event.likes),
+        view_count=int(event.view_count),
     )
 
 # helper
@@ -308,10 +309,12 @@ async def handle_events(event_id: str, db: Session = Depends(database.get_db), t
         
         if not event:
             raise HTTPException(404, detail="Event not found")
-                
+
+        # Increment view count
+        event.view_count += 1
+        db.commit()
 
         event_complex = map_event_to_response(event)
-        logger.info(f"likes count from get events: {event_complex.likes}")
 
         return schemas.SingleEventResponse(success=True, data=event_complex)
             
@@ -1067,6 +1070,129 @@ async def get_announcements(
         raise he
     except Exception as e:
         logger.info(f"Error fetching announcements: {e}")
+        db.rollback()
+        raise HTTPException(500, detail="Internal server error")
+
+
+# ==================== SUBSCRIPTIONS ====================
+
+def map_subscription_to_response(sub: models.Subscription) -> schemas.SubscriptionResponse:
+    return schemas.SubscriptionResponse(
+        id=str(sub.id),
+        email=sub.email,
+        club_ids=[c.strip() for c in sub.club_ids.split(",") if c.strip()] if sub.club_ids else [],
+        categories=[c.strip() for c in sub.categories.split(",") if c.strip()] if sub.categories else [],
+        is_active=sub.is_active,
+        created_at=sub.created_at,
+    )
+
+
+@api.post("/subscribe", response_model=schemas.SingleSubscriptionResponse)
+@limiter.limit("5/minute")
+async def subscribe(
+    request: Request,
+    sub_in: schemas.SubscribeRequest,
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """
+    Public endpoint. Students subscribe with just their email.
+    They can pick clubs and/or categories to follow.
+    """
+    try:
+        # Check if email already subscribed
+        existing = db.query(models.Subscription).filter(
+            models.Subscription.email == sub_in.email
+        ).first()
+
+        if existing:
+            # Update existing subscription preferences
+            existing.club_ids = ",".join(sub_in.club_ids) if sub_in.club_ids else ""
+            existing.categories = ",".join(sub_in.categories) if sub_in.categories else ""
+            existing.is_active = True
+            db.commit()
+            db.refresh(existing)
+            return schemas.SingleSubscriptionResponse(
+                success=True, data=map_subscription_to_response(existing)
+            )
+
+        # Create new subscription
+        import secrets as sec
+        new_sub = models.Subscription(
+            email=sub_in.email,
+            token=sec.token_urlsafe(32),
+            club_ids=",".join(sub_in.club_ids) if sub_in.club_ids else "",
+            categories=",".join(sub_in.categories) if sub_in.categories else "",
+        )
+        db.add(new_sub)
+        db.commit()
+        db.refresh(new_sub)
+
+        return schemas.SingleSubscriptionResponse(
+            success=True, data=map_subscription_to_response(new_sub)
+        )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.info(f"Error in subscribe: {e}")
+        db.rollback()
+        raise HTTPException(500, detail="Failed to subscribe")
+
+
+@api.delete("/unsubscribe/{token}")
+async def unsubscribe(
+    token: str,
+    db: Session = Depends(database.get_db),
+):
+    """
+    Public endpoint. Unsubscribe via token (from email link).
+    No auth needed — the token itself is the proof.
+    """
+    sub = db.query(models.Subscription).filter(
+        models.Subscription.token == token
+    ).first()
+
+    if not sub:
+        raise HTTPException(404, detail="Subscription not found")
+
+    sub.is_active = False
+    db.commit()
+
+    return {"success": True, "message": "Unsubscribed successfully"}
+
+
+@api.get("/admin/subscriptions", response_model=schemas.MultiSubscriptionResponse)
+async def get_subscriptions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Admin-only: view all active subscriptions."""
+    if current_user.role != "admin":
+        raise HTTPException(403, detail="Admin only")
+
+    try:
+        base_query = select(models.Subscription).where(models.Subscription.is_active == True)
+        total = db.execute(select(func.count()).select_from(base_query.subquery())).scalar()
+
+        subs = db.execute(
+            base_query.order_by(models.Subscription.created_at.desc())
+            .offset((page - 1) * page_size).limit(page_size)
+        ).scalars().all()
+
+        return schemas.MultiSubscriptionResponse(
+            success=True,
+            data=[map_subscription_to_response(s) for s in subs],
+            pagination=paginate(page, page_size, total),
+        )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.info(f"Error fetching subscriptions: {e}")
         db.rollback()
         raise HTTPException(500, detail="Internal server error")
 
