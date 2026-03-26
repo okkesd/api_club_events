@@ -54,13 +54,13 @@ def get_active_subscribers(db):
 
 
 def filter_events_for_subscriber(events, subscriber):
-    """Filter events based on subscriber preferences."""
+    """Filter events based on subscriber preferences (uses ClubSubscription relationship)."""
     sub_club_ids = set(
-        c.strip() for c in subscriber.club_ids.split(",") if c.strip()
+        cs.club_id for cs in subscriber.club_subscriptions if cs.is_active
     )
     sub_categories = set(
         c.strip() for c in subscriber.categories.split(",") if c.strip()
-    )
+    ) if subscriber.categories else set()
 
     # If no preferences set, send all events
     if not sub_club_ids and not sub_categories:

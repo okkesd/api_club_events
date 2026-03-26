@@ -124,8 +124,8 @@ class EventBase(CamelModel):
     # Registration Logic
     is_registration_open: bool = False
     registration_link: Optional[str] = None
-    capacity: Optional[int] = Field(None, gt=0)
-    likes: int
+    capacity: Optional[int] = Field(None, ge=0)
+    likes: int = 0
     view_count: int = 0
 
     @field_validator("start_time", "end_time")
@@ -192,10 +192,13 @@ class MultiEventResponse(ApiResponse):
     data: List[EventResponse]
     pagination: Optional[PaginationMeta] = None
 
-class EventLikeResponse(CamelModel):
-    success: bool
+class EventLikeData(CamelModel):
     likes: int
     has_liked: bool
+
+class EventLikeResponse(CamelModel):
+    success: bool
+    data: EventLikeData
 
 # --- ANNOUNCEMENTS ---
 
@@ -254,13 +257,21 @@ class ContactReturn(BaseModel):
 
 class SubscribeRequest(CamelModel):
     email: EmailStr
-    club_ids: List[str] = []
+    club_ids: List[str] = []       # creates ClubSubscription rows
     categories: List[str] = []
+
+class ClubSubscribeRequest(CamelModel):
+    email: EmailStr
+
+class ClubSubscriptionInfo(CamelModel):
+    club_id: str
+    club_name: str
+    is_active: bool
 
 class SubscriptionResponse(CamelModel):
     id: str
     email: str
-    club_ids: List[str]
+    clubs: List[ClubSubscriptionInfo] = []
     categories: List[str]
     is_active: bool
     created_at: datetime.datetime
@@ -271,3 +282,8 @@ class SingleSubscriptionResponse(ApiResponse):
 class MultiSubscriptionResponse(ApiResponse):
     data: List[SubscriptionResponse]
     pagination: Optional[PaginationMeta] = None
+
+class ClubSubscriptionToggleResponse(CamelModel):
+    success: bool
+    message: str
+    is_subscribed: bool

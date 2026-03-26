@@ -121,16 +121,32 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
-    email: Mapped[str] = mapped_column(String, index=True)
-    token: Mapped[str] = mapped_column(String, unique=True, index=True)  # for unsubscribe link
-
-    # What they subscribe to (comma-separated club IDs and/or category keywords)
-    club_ids: Mapped[str] = mapped_column(Text, default="")  # comma-separated club UUIDs
+    email: Mapped[str] = mapped_column(String, unique=True, index=True)
+    token: Mapped[str] = mapped_column(String, unique=True, index=True)  # master unsubscribe
     categories: Mapped[str] = mapped_column(Text, default="")  # comma-separated: "workshop,social,career"
-
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, index=True)
 
+    # Relationships
+    club_subscriptions = relationship("ClubSubscription", back_populates="subscription", cascade="all, delete-orphan")
+
+
+class ClubSubscription(Base):
+    __tablename__ = "club_subscriptions"
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "club_id", name="uix_subscription_club"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    subscription_id: Mapped[str] = mapped_column(String, ForeignKey("subscriptions.id", ondelete="CASCADE"), index=True)
+    club_id: Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token: Mapped[str] = mapped_column(String, unique=True, index=True)  # per-club unsubscribe
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+
+    # Relationships
+    subscription = relationship("Subscription", back_populates="club_subscriptions")
+    club = relationship("User")
 
 class Announcement(Base):
     __tablename__ = "announcements"

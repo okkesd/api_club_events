@@ -249,6 +249,7 @@ async def browse_events(
     club_id: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    sort_order: str = Query("desc"),
     db: Session = Depends(database.get_db),
     token: str = Depends(verify_api_key),
 ):
@@ -276,10 +277,13 @@ async def browse_events(
 
         total = db.execute(select(func.count()).select_from(base_query.subquery())).scalar()
 
+        order_clause = models.Event.date.asc() if sort_order == "asc" else models.Event.date.desc()
+
         query = (
             base_query
             .join(models.Event.owner)
             .options(contains_eager(models.Event.owner))
+            .order_by(order_clause)
             .order_by(models.Event.date.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
@@ -965,6 +969,7 @@ async def get_all_clubs_user(
         logger.info("Exception occured in get all clubs user: %s", e)
         db.rollback()
         raise HTTPException(500, "Internal server error getting clubs")
+
 @api.post("/event_like/{event_id}", response_model=schemas.EventLikeResponse)
 async def handle_event_like(
     event_id: str,
@@ -1009,7 +1014,13 @@ async def handle_event_like(
 
         bg_tasks.add_task(revalidate_frontend, ["events"])
 
-        return schemas.EventLikeResponse(success=True, likes=int(event.likes), has_liked=has_liked)
+        return schemas.EventLikeResponse(
+            success=True, 
+            data=schemas.EventLikeData(
+                likes=int(event.likes), 
+                has_liked=has_liked
+            )
+            )
 
     except HTTPException as he:
         raise he
@@ -1101,11 +1112,33 @@ async def get_announcements(
 
 # ==================== SUBSCRIPTIONS ====================
 
+def _get_or_create_subscription(db: Session, email: str) -> models.Subscription:
+    """Find existing subscription by email, or create a new one."""
+    import secrets as sec
+    sub = db.query(models.Subscription).filter(models.Subscription.email == email).first()
+    if not sub:
+        sub = models.Subscription(
+            email=email,
+            token=sec.token_urlsafe(32),
+        )
+        db.add(sub)
+        db.flush()  # get the ID without committing
+    return sub
+
+
 def map_subscription_to_response(sub: models.Subscription) -> schemas.SubscriptionResponse:
+    clubs = [
+        schemas.ClubSubscriptionInfo(
+            club_id=cs.club_id,
+            club_name=cs.club.club_name if cs.club else "Unknown",
+            is_active=cs.is_active,
+        )
+        for cs in sub.club_subscriptions
+    ]
     return schemas.SubscriptionResponse(
         id=str(sub.id),
         email=sub.email,
-        club_ids=[c.strip() for c in sub.club_ids.split(",") if c.strip()] if sub.club_ids else [],
+        clubs=clubs,
         categories=[c.strip() for c in sub.categories.split(",") if c.strip()] if sub.categories else [],
         is_active=sub.is_active,
         created_at=sub.created_at,
@@ -1122,39 +1155,37 @@ async def subscribe(
 ):
     """
     Public endpoint. Students subscribe with just their email.
-    They can pick clubs and/or categories to follow.
+    Optionally pass club_ids and/or categories.
     """
+    import secrets as sec
     try:
-        # Check if email already subscribed
-        existing = db.query(models.Subscription).filter(
-            models.Subscription.email == sub_in.email
-        ).first()
+        sub = _get_or_create_subscription(db, sub_in.email)
 
-        if existing:
-            # Update existing subscription preferences
-            existing.club_ids = ",".join(sub_in.club_ids) if sub_in.club_ids else ""
-            existing.categories = ",".join(sub_in.categories) if sub_in.categories else ""
-            existing.is_active = True
-            db.commit()
-            db.refresh(existing)
-            return schemas.SingleSubscriptionResponse(
-                success=True, data=map_subscription_to_response(existing)
-            )
+        # Update categories
+        if sub_in.categories:
+            sub.categories = ",".join(sub_in.categories)
+        sub.is_active = True
 
-        # Create new subscription
-        import secrets as sec
-        new_sub = models.Subscription(
-            email=sub_in.email,
-            token=sec.token_urlsafe(32),
-            club_ids=",".join(sub_in.club_ids) if sub_in.club_ids else "",
-            categories=",".join(sub_in.categories) if sub_in.categories else "",
-        )
-        db.add(new_sub)
+        # Create ClubSubscription rows for any requested club_ids
+        for club_id in sub_in.club_ids:
+            existing_cs = db.query(models.ClubSubscription).filter(
+                models.ClubSubscription.subscription_id == sub.id,
+                models.ClubSubscription.club_id == club_id,
+            ).first()
+            if not existing_cs:
+                db.add(models.ClubSubscription(
+                    subscription_id=sub.id,
+                    club_id=club_id,
+                    token=sec.token_urlsafe(32),
+                ))
+            elif not existing_cs.is_active:
+                existing_cs.is_active = True
+
         db.commit()
-        db.refresh(new_sub)
+        db.refresh(sub)
 
         return schemas.SingleSubscriptionResponse(
-            success=True, data=map_subscription_to_response(new_sub)
+            success=True, data=map_subscription_to_response(sub)
         )
 
     except HTTPException as he:
@@ -1165,6 +1196,52 @@ async def subscribe(
         raise HTTPException(500, detail="Failed to subscribe")
 
 
+@api.post("/clubs/{club_id}/subscribe", response_model=schemas.ClubSubscriptionToggleResponse)
+async def toggle_club_subscription(
+    club_id: str,
+    req: schemas.ClubSubscribeRequest,
+    db: Session = Depends(database.get_db),
+):
+    """Toggle subscription to a specific club by email."""
+    import secrets as sec
+
+    club = db.query(models.User).filter(models.User.id == club_id).first()
+    if not club:
+        raise HTTPException(404, "Club not found")
+
+    sub = _get_or_create_subscription(db, req.email)
+
+    # Check if a ClubSubscription already exists
+    cs = db.query(models.ClubSubscription).filter(
+        models.ClubSubscription.subscription_id == sub.id,
+        models.ClubSubscription.club_id == club_id,
+    ).first()
+
+    if cs and cs.is_active:
+        cs.is_active = False
+        message = "Unsubscribed from club"
+        is_subscribed = False
+    elif cs:
+        cs.is_active = True
+        message = "Subscribed to club!"
+        is_subscribed = True
+    else:
+        db.add(models.ClubSubscription(
+            subscription_id=sub.id,
+            club_id=club_id,
+            token=sec.token_urlsafe(32),
+        ))
+        message = "Subscribed to club!"
+        is_subscribed = True
+
+    sub.is_active = True
+    db.commit()
+
+    return schemas.ClubSubscriptionToggleResponse(
+        success=True, message=message, is_subscribed=is_subscribed
+    )
+
+
 @api.delete("/unsubscribe/{token}")
 async def unsubscribe(
     token: str,
@@ -1172,19 +1249,29 @@ async def unsubscribe(
 ):
     """
     Public endpoint. Unsubscribe via token (from email link).
-    No auth needed — the token itself is the proof.
+    Works for both master tokens (deactivates everything) and per-club tokens.
     """
+    # Check master token first
     sub = db.query(models.Subscription).filter(
         models.Subscription.token == token
     ).first()
+    if sub:
+        sub.is_active = False
+        for cs in sub.club_subscriptions:
+            cs.is_active = False
+        db.commit()
+        return {"success": True, "message": "Unsubscribed from all"}
 
-    if not sub:
-        raise HTTPException(404, detail="Subscription not found")
+    # Check per-club token
+    cs = db.query(models.ClubSubscription).filter(
+        models.ClubSubscription.token == token
+    ).first()
+    if cs:
+        cs.is_active = False
+        db.commit()
+        return {"success": True, "message": "Unsubscribed from club"}
 
-    sub.is_active = False
-    db.commit()
-
-    return {"success": True, "message": "Unsubscribed successfully"}
+    raise HTTPException(404, detail="Subscription not found")
 
 
 @api.get("/admin/subscriptions", response_model=schemas.MultiSubscriptionResponse)
