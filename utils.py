@@ -51,10 +51,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     try:
         # 1. Decode Token
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        print(payload)
         # 2. Extract ID (encoded as "sub" in login function)
         user_id: str | None = payload.get("sub")
-        print(user_id)
 
         if payload.get("sub") is None:
             print("No sub found")

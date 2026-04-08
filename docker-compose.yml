@@ -36,7 +36,7 @@ services:
       - BACKEND_URL=http://backend:4444
       - NEXTJS_APP_URL=${FRONTEND_URL}
       - API_SECRET_KEY=${API_SECRET_KEY}
-      - REVALIDATION_KEY=${REVALIDATION_TOKEN}
+      - REVALIDATION_TOKEN=${REVALIDATION_TOKEN}
       - NODE_ENV=production
     depends_on:
       backend:

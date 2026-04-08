@@ -1,6 +1,8 @@
 import io
 import os
 import logging
+from typing import Optional
+
 import requests
 from PIL import Image
 from dotenv import load_dotenv
@@ -45,7 +47,7 @@ def upload_to_supabase(file_bytes: bytes, filename: str, content_type: str) -> s
 
     url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}"
     headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
         "Content-Type": content_type,
         "x-upsert": "true",
     }
@@ -74,7 +76,7 @@ def delete_from_supabase(file_url: str) -> bool:
 
     url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}"
     headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
         "Content-Type": "application/json",
     }
 
@@ -86,3 +88,60 @@ def delete_from_supabase(file_url: str) -> bool:
 
     logger.error(f"Failed to delete from storage: {response.text}")
     return False
+
+
+def list_storage_files(prefix: str = "", limit: int = 1000, offset: int = 0) -> list[dict]:
+    """List files in the Supabase Storage bucket."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return []
+
+    url = f"{SUPABASE_URL}/storage/v1/object/list/{STORAGE_BUCKET}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": "application/json",
+    }
+    body = {"prefix": prefix, "limit": limit, "offset": offset}
+
+    response = requests.post(url, headers=headers, json=body, timeout=30)
+    if response.status_code == 200:
+        return response.json()
+    logger.error(f"Failed to list storage files: {response.text}")
+    return []
+
+
+def cleanup_orphaned_images(db_session) -> dict:
+    """Delete images from storage that aren't referenced by any event, announcement, or user."""
+    from models import Event, Announcement, User
+
+    # Collect all referenced image URLs from the database
+    referenced_urls = set()
+
+    for url, in db_session.query(Event.cover_image).filter(Event.cover_image.isnot(None)).all():
+        referenced_urls.add(url)
+    for url, in db_session.query(Announcement.cover_image).filter(Announcement.cover_image.isnot(None)).all():
+        referenced_urls.add(url)
+    for url, in db_session.query(User.logo_url).filter(User.logo_url.isnot(None)).all():
+        referenced_urls.add(url)
+
+    # Extract just the filenames from referenced URLs
+    public_prefix = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/"
+    referenced_filenames = set()
+    for url in referenced_urls:
+        if url.startswith(public_prefix):
+            referenced_filenames.add(url[len(public_prefix):])
+
+    # List all files in storage
+    storage_files = list_storage_files()
+    filenames_in_storage = [f["name"] for f in storage_files if f.get("name")]
+
+    # Find orphans
+    orphans = [f for f in filenames_in_storage if f not in referenced_filenames]
+
+    deleted = 0
+    for filename in orphans:
+        full_url = f"{public_prefix}{filename}"
+        if delete_from_supabase(full_url):
+            deleted += 1
+
+    logger.info(f"Storage cleanup: {deleted}/{len(orphans)} orphaned images deleted, {len(filenames_in_storage) - len(orphans)} in use")
+    return {"total_in_storage": len(filenames_in_storage), "orphans_found": len(orphans), "deleted": deleted}
