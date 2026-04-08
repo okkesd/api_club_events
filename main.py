@@ -126,12 +126,12 @@ def revalidate_frontend(tags: list[str]):
     except Exception as e:
         logger.info(f"❌ Error triggering revalidation: {e}")
 
-# helper — extract client IP from X-Forwarded-For or fall back to request.client
-def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+# helper — extract visitor ID from X-Visitor-Id header (no IP fallback)
+def get_visitor_id(request: Request) -> Optional[str]:
+    visitor = request.headers.get("x-visitor-id")
+    if visitor and visitor != "unknown":
+        return visitor
+    return None
 
 # helper
 def map_event_to_response(event: models.Event, has_liked: bool = False) -> schemas.EventResponse:
@@ -223,7 +223,21 @@ async def weekly_events(
         )
         db_events = db.execute(query).scalars().unique().all()
 
-        data_to_send = [map_event_to_response(event) for event in db_events]
+        # Resolve has_liked per event for this visitor
+        visitor_id = get_visitor_id(request)
+        liked_ids = set()
+        if visitor_id:
+            event_ids = [e.id for e in db_events]
+            if event_ids:
+                liked_rows = db.execute(
+                    select(models.EventLike.event_id).where(
+                        models.EventLike.event_id.in_(event_ids),
+                        models.EventLike.visitor_id == visitor_id,
+                    )
+                ).scalars().all()
+                liked_ids = set(liked_rows)
+
+        data_to_send = [map_event_to_response(event, has_liked=event.id in liked_ids) for event in db_events]
 
         return schemas.MultiEventResponse(
             success=True, data=data_to_send, pagination=paginate(page, page_size, total)
@@ -231,7 +245,7 @@ async def weekly_events(
 
     except HTTPException as he:
         raise he
-    
+
     except Exception as e:
         logger.info(f"❌ CRITICAL ERROR in weekly_events: {e}")
         db.rollback()
@@ -241,6 +255,7 @@ async def weekly_events(
 # browse/search events
 @api.get("/events", response_model=schemas.MultiEventResponse)
 async def browse_events(
+    request: Request,
     search: Optional[str] = None,
     tag: Optional[str] = None,
     location_type: Optional[str] = None,
@@ -290,7 +305,20 @@ async def browse_events(
         )
         db_events = db.execute(query).scalars().unique().all()
 
-        data = [map_event_to_response(event) for event in db_events]
+        visitor_id = get_visitor_id(request)
+        liked_ids = set()
+        if visitor_id:
+            event_ids = [e.id for e in db_events]
+            if event_ids:
+                liked_rows = db.execute(
+                    select(models.EventLike.event_id).where(
+                        models.EventLike.event_id.in_(event_ids),
+                        models.EventLike.visitor_id == visitor_id,
+                    )
+                ).scalars().all()
+                liked_ids = set(liked_rows)
+
+        data = [map_event_to_response(event, has_liked=event.id in liked_ids) for event in db_events]
 
         return schemas.MultiEventResponse(
             success=True, data=data, pagination=paginate(page, page_size, total)
@@ -322,18 +350,29 @@ async def handle_events(event_id: str, request: Request, db: Session = Depends(d
         if not event:
             raise HTTPException(404, detail="Event not found")
 
-        # Increment view count
-        event.view_count += 1
-        db.commit()
+        visitor_id = get_visitor_id(request)
+        has_liked = False
 
-        # Check if this IP has liked the event
-        client_ip = get_client_ip(request)
-        has_liked = db.execute(
-            select(models.EventLike).where(
-                models.EventLike.event_id == event_id,
-                models.EventLike.ip_address == client_ip,
-            )
-        ).scalar() is not None
+        if visitor_id:
+            # Deduplicated view count — only track when visitor is identified
+            already_viewed = db.execute(
+                select(models.EventView).where(
+                    models.EventView.event_id == event_id,
+                    models.EventView.visitor_id == visitor_id,
+                )
+            ).scalar()
+            if not already_viewed:
+                db.add(models.EventView(event_id=event_id, visitor_id=visitor_id))
+                event.view_count += 1
+                db.commit()
+
+            # Check if this visitor has liked the event
+            has_liked = db.execute(
+                select(models.EventLike).where(
+                    models.EventLike.event_id == event_id,
+                    models.EventLike.visitor_id == visitor_id,
+                )
+            ).scalar() is not None
 
         event_complex = map_event_to_response(event, has_liked=has_liked)
 
@@ -379,6 +418,7 @@ async def handle_club(club_id: str, db: Session = Depends(database.get_db), toke
 @api.get("/clubs/{club_id}/events", response_model=schemas.MultiEventResponse)
 async def handle_club_events(
     club_id: str,
+    request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(database.get_db),
@@ -397,7 +437,20 @@ async def handle_club_events(
         )
         result = db.execute(query).scalars().unique().all()
 
-        clubs_events = [map_event_to_response(event) for event in result]
+        visitor_id = get_visitor_id(request)
+        liked_ids = set()
+        if visitor_id:
+            event_ids = [e.id for e in result]
+            if event_ids:
+                liked_rows = db.execute(
+                    select(models.EventLike.event_id).where(
+                        models.EventLike.event_id.in_(event_ids),
+                        models.EventLike.visitor_id == visitor_id,
+                    )
+                ).scalars().all()
+                liked_ids = set(liked_rows)
+
+        clubs_events = [map_event_to_response(event, has_liked=event.id in liked_ids) for event in result]
 
         return schemas.MultiEventResponse(
             success=True, data=clubs_events, pagination=paginate(page, page_size, total)
@@ -979,7 +1032,9 @@ async def handle_event_like(
     token: str = Depends(verify_api_key),
 ):
     try:
-        client_ip = get_client_ip(request)
+        visitor_id = get_visitor_id(request)
+        if not visitor_id:
+            raise HTTPException(status_code=400, detail="Visitor ID required")
 
         event = db.execute(
             select(models.Event).where(models.Event.id == event_id)
@@ -988,11 +1043,11 @@ async def handle_event_like(
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
 
-        # Check if this IP already liked this event
+        # Check if this visitor already liked this event
         existing_like = db.execute(
             select(models.EventLike).where(
                 models.EventLike.event_id == event_id,
-                models.EventLike.ip_address == client_ip,
+                models.EventLike.visitor_id == visitor_id,
             )
         ).scalar()
 
@@ -1003,14 +1058,14 @@ async def handle_event_like(
             has_liked = False
         else:
             # Like — insert row and increment
-            new_like = models.EventLike(event_id=event_id, ip_address=client_ip)
+            new_like = models.EventLike(event_id=event_id, visitor_id=visitor_id)
             db.add(new_like)
             event.likes += 1
             has_liked = True
 
         db.commit()
         db.refresh(event)
-        logger.info(f"like toggle: event={event_id} ip={client_ip} liked={has_liked} total={event.likes}")
+        logger.info(f"like toggle: event={event_id} visitor={visitor_id} liked={has_liked} total={event.likes}")
 
         bg_tasks.add_task(revalidate_frontend, ["events"])
 
@@ -1052,7 +1107,7 @@ def map_announcement_to_response(a: models.Announcement) -> schemas.Announcement
 
 @api.get("/announcements", response_model=schemas.MultiAnnouncementResponse)
 async def get_announcements(
-    category: Optional[str] = None,
+    category: Optional[List[str]] = Query(None),
     club_id: Optional[str] = None,
     tag: Optional[str] = None,
     search: Optional[str] = None,
@@ -1068,7 +1123,7 @@ async def get_announcements(
         )
 
         if category:
-            query = query.where(models.Announcement.category == category)
+            query = query.where(models.Announcement.category.in_(category))
         if club_id:
             query = query.where(models.Announcement.club_id == club_id)
         if tag:
@@ -1135,11 +1190,18 @@ def map_subscription_to_response(sub: models.Subscription) -> schemas.Subscripti
         )
         for cs in sub.club_subscriptions
     ]
+    categories = [
+        schemas.CategorySubscriptionInfo(
+            category=cat_sub.category.value if hasattr(cat_sub.category, 'value') else cat_sub.category,
+            is_active=cat_sub.is_active,
+        )
+        for cat_sub in sub.category_subscriptions
+    ]
     return schemas.SubscriptionResponse(
         id=str(sub.id),
         email=sub.email,
         clubs=clubs,
-        categories=[c.strip() for c in sub.categories.split(",") if c.strip()] if sub.categories else [],
+        categories=categories,
         is_active=sub.is_active,
         created_at=sub.created_at,
     )
@@ -1161,9 +1223,20 @@ async def subscribe(
     try:
         sub = _get_or_create_subscription(db, sub_in.email)
 
-        # Update categories
-        if sub_in.categories:
-            sub.categories = ",".join(sub_in.categories)
+        # Create CategorySubscription rows for any requested categories
+        for category in sub_in.categories:
+            existing_cat = db.query(models.CategorySubscription).filter(
+                models.CategorySubscription.subscription_id == sub.id,
+                models.CategorySubscription.category == category,
+            ).first()
+            if not existing_cat:
+                db.add(models.CategorySubscription(
+                    subscription_id=sub.id,
+                    category=category,
+                ))
+            elif not existing_cat.is_active:
+                existing_cat.is_active = True
+
         sub.is_active = True
 
         # Create ClubSubscription rows for any requested club_ids
@@ -1309,6 +1382,20 @@ async def get_subscriptions(
         raise HTTPException(500, detail="Internal server error")
 
 
+@api.post("/admin/cleanup-storage")
+async def cleanup_storage(
+    current_user: models.User = Depends(utils.get_current_user),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Admin-only: delete orphaned images from Supabase Storage."""
+    if current_user.role != "admin":
+        raise HTTPException(403, detail="Admin only")
+
+    result = storage.cleanup_orphaned_images(db)
+    return {"success": True, **result}
+
+
 @api.get("/announcements/{announcement_id}", response_model=schemas.SingleAnnouncementResponse)
 async def get_announcement(
     announcement_id: str,
@@ -1362,6 +1449,23 @@ async def create_announcement(
     slug = models.generate_slug(f"{announcement_in.title} {datetime.now().strftime('%Y%m%d%H%M')}")
     tags_string = ",".join(announcement_in.tags) if announcement_in.tags else ""
 
+    # --- NEW: Enforce 14-day maximum expiration ---
+    max_date = (datetime.utcnow() + timedelta(days=14)).date()
+    final_expires_at = None
+    
+    if announcement_in.expires_at:
+        # Pydantic usually parses this as a datetime.date object.
+        # If your schema leaves it as a string, uncomment the line below:
+        # incoming_date = datetime.strptime(announcement_in.expires_at, "%Y-%m-%d").date()
+        incoming_date = announcement_in.expires_at 
+        
+        # Take whichever is sooner: their requested date, or our 14-day max
+        final_expires_at = min(incoming_date, max_date)
+    else:
+        # Default to 7 days if they didn't provide one
+        final_expires_at = (datetime.utcnow() + timedelta(days=7)).date()
+    # ----------------------------------------------
+
     db_announcement = models.Announcement(
         slug=slug,
         title=announcement_in.title,
@@ -1371,7 +1475,7 @@ async def create_announcement(
         tags=tags_string,
         category=announcement_in.category,
         is_pinned=announcement_in.is_pinned if current_user.role == "admin" else False,
-        expires_at=announcement_in.expires_at,
+        expires_at=final_expires_at, # <-- Use the safe calculated date here
         club_id=announcement_in.club_id,
     )
 
@@ -1417,7 +1521,13 @@ async def update_announcement(
     if update.link is not None: db_a.link = update.link
     if update.tags is not None: db_a.tags = ",".join(update.tags)
     if update.category is not None: db_a.category = update.category
-    if update.expires_at is not None: db_a.expires_at = update.expires_at
+    
+    # --- NEW: Enforce 14-day limit on updates ---
+    if update.expires_at is not None: 
+        max_date = (datetime.utcnow() + timedelta(days=14)).date()
+        incoming_date = update.expires_at # Again, assuming Pydantic casts to datetime.date
+        db_a.expires_at = min(incoming_date, max_date)
+    # --------------------------------------------
 
     # Only admin can pin
     if update.is_pinned is not None and current_user.role == "admin":
