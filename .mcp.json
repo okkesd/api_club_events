@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bridge": {
+      "command": "node",
+      "args": ["/home/debianokkes/okkes/bridge_server/server.js", "--agent-id", "backend"]
+    }
+  }
+}
