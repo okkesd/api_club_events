@@ -59,8 +59,9 @@ def filter_events_for_subscriber(events, subscriber):
         cs.club_id for cs in subscriber.club_subscriptions if cs.is_active
     )
     sub_categories = set(
-        c.strip() for c in subscriber.categories.split(",") if c.strip()
-    ) if subscriber.categories else set()
+        cs.category.value if hasattr(cs.category, 'value') else cs.category
+        for cs in subscriber.category_subscriptions if cs.is_active
+    )
 
     # If no preferences set, send all events
     if not sub_club_ids and not sub_categories:

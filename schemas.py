@@ -268,11 +268,15 @@ class ClubSubscriptionInfo(CamelModel):
     club_name: str
     is_active: bool
 
+class CategorySubscriptionInfo(CamelModel):
+    category: str
+    is_active: bool
+
 class SubscriptionResponse(CamelModel):
     id: str
     email: str
     clubs: List[ClubSubscriptionInfo] = []
-    categories: List[str]
+    categories: List[CategorySubscriptionInfo] = []
     is_active: bool
     created_at: datetime.datetime
 

@@ -106,15 +106,29 @@ class Event(Base):
 class EventLike(Base):
     __tablename__ = "event_likes"
     __table_args__ = (
-        UniqueConstraint("event_id", "ip_address", name="uq_event_ip"),
+        UniqueConstraint("event_id", "visitor_id", name="uq_event_visitor"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
     event_id: Mapped[str] = mapped_column(String, ForeignKey("events.id", ondelete="CASCADE"))
-    ip_address: Mapped[str] = mapped_column(String, index=True)
+    visitor_id: Mapped[str] = mapped_column(String, index=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
 
     event = relationship("Event", back_populates="event_likes")
+
+
+class EventView(Base):
+    __tablename__ = "event_views"
+    __table_args__ = (
+        UniqueConstraint("event_id", "visitor_id", name="uq_event_view_visitor"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    event_id: Mapped[str] = mapped_column(String, ForeignKey("events.id", ondelete="CASCADE"))
+    visitor_id: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+
+    event = relationship("Event")
 
 
 class Subscription(Base):
@@ -129,6 +143,7 @@ class Subscription(Base):
 
     # Relationships
     club_subscriptions = relationship("ClubSubscription", back_populates="subscription", cascade="all, delete-orphan")
+    category_subscriptions = relationship("CategorySubscription", back_populates="subscription", cascade="all, delete-orphan")
 
 
 class ClubSubscription(Base):
@@ -147,6 +162,25 @@ class ClubSubscription(Base):
     # Relationships
     subscription = relationship("Subscription", back_populates="club_subscriptions")
     club = relationship("User")
+
+class CategorySubscription(Base):
+    __tablename__ = "category_subscriptions"
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "category", name="uix_subscription_category"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    subscription_id: Mapped[str] = mapped_column(String, ForeignKey("subscriptions.id", ondelete="CASCADE"), index=True)
+    category: Mapped[str] = mapped_column(
+        SQLEnum(AnnouncementCategory),
+        nullable=False,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+
+    # Relationships
+    subscription = relationship("Subscription", back_populates="category_subscriptions")
+
 
 class Announcement(Base):
     __tablename__ = "announcements"
