@@ -80,6 +80,9 @@ jobs:
             JWT_EXPIRE_MINUTES=60
             ADMIN_EMAIL=${{ secrets.ADMIN_EMAIL }}
             ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
+            SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY=${{ secrets.SUPABASE_SERVICE_KEY }}
+            STORAGE_BUCKET=${{ secrets.STORAGE_BUCKET }}
             ENVEOF
             
             # Pull the new backend image we just pushed
