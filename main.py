@@ -1628,9 +1628,9 @@ async def get_contacts(
             raise HTTPException(status_code=403, detail="Forbidden, please don't try")
 
         now = datetime.now()
-        a_week_ago = now - dt.timedelta(7)
+        a_month_ago = now - dt.timedelta(30)
 
-        query = select(models.Contact).where(models.Contact.date > a_week_ago)
+        query = select(models.Contact).where(models.Contact.date > a_month_ago)
         result = db.execute(query).scalars().all()
 
         if not result:
