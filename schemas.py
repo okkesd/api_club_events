@@ -85,6 +85,8 @@ class ClubBase(CamelModel):
 
 class ClubUpdate(CamelModel):
     club_name: Optional[str] = None
+    # Instagram handle used to auto-match scraped events to this club (admin only)
+    ig_username: Optional[str] = None
     email: Optional[EmailStr] = None
     description: Optional[str] = None
     logo_url: Optional[str] = None
@@ -99,6 +101,7 @@ class ClubResponse(ClubBase):
     role: str
     is_verified: bool
     rejection_reason: Optional[str] = None
+    ig_username: Optional[str] = None
 
 class ClubApiResponse(ApiResponse):
     data: Optional[ClubResponse] = None
@@ -164,7 +167,8 @@ class EventUpdate(CamelModel):
     cover_image: Optional[str] = None
     is_registration_open: Optional[bool] = None
     registration_link: Optional[str] = None
-    capacity: Optional[int] = Field(None, gt=0)
+    # 0 means "no limit", same as on create — an empty capacity field in the form sends 0.
+    capacity: Optional[int] = Field(None, ge=0)
     likes: Optional[int] = None
 
     @field_validator("start_time", "end_time")
@@ -291,3 +295,116 @@ class ClubSubscriptionToggleResponse(CamelModel):
     success: bool
     message: str
     is_subscribed: bool
+# --- SCRAPED EVENTS (admin approval inbox) ---
+
+class ScrapedEventResponse(CamelModel):
+    id: str
+    source: str
+    source_event_id: str
+
+    # Source post context, so the admin can judge without leaving the panel
+    club_username: str
+    post_shortcode: str
+    post_url: Optional[str] = None
+    post_caption: Optional[str] = None
+    post_image_url: Optional[str] = None
+    posted_at: Optional[datetime.datetime] = None
+
+    # Extracted content
+    title: Optional[str] = None
+    date: Optional[datetime.datetime] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
+    confidence: float
+
+    # Review state
+    status: str
+    rejection_reason: Optional[str] = None
+    reviewed_at: Optional[datetime.datetime] = None
+    club_id: Optional[str] = None
+    club_name: Optional[str] = None
+    # true when club_id came from a remembered handle mapping rather than a fresh guess
+    club_is_remembered: bool = False
+    created_event_id: Optional[str] = None
+    created_at: datetime.datetime
+
+
+class SingleScrapedEventResponse(ApiResponse):
+    data: Optional[ScrapedEventResponse] = None
+
+
+class MultiScrapedEventResponse(ApiResponse):
+    data: List[ScrapedEventResponse]
+    pagination: Optional[PaginationMeta] = None
+
+
+class ScrapedEventUpdate(CamelModel):
+    """Admin fixes to the extracted content before approving."""
+    title: Optional[str] = Field(None, max_length=200)
+    date: Optional[datetime.datetime] = None
+    location: Optional[str] = Field(None, max_length=500)
+    description: Optional[str] = Field(None, max_length=5000)
+    club_id: Optional[str] = None
+
+
+class IgClubMappingResponse(CamelModel):
+    club_username: str
+    user_id: str
+    user_name: str
+    is_admin: bool
+    updated_at: datetime.datetime
+
+
+class MultiIgClubMappingResponse(ApiResponse):
+    data: List[IgClubMappingResponse]
+
+
+class ScrapedEventApprove(CamelModel):
+    """Everything the real Event needs that the extractor cannot know.
+
+    Anything left out falls back to the extracted value (or a sane default:
+    2-hour on-campus event starting at the extracted time).
+    """
+    club_id: Optional[str] = None
+    # Publish under the admin account instead of a club — for handles whose club is not
+    # on the platform, or does not want its name on the listing.
+    publish_as_admin: bool = False
+    title: Optional[str] = Field(None, max_length=200)
+    description: Optional[str] = Field(None, max_length=5000)
+    date: Optional[datetime.date] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    duration: Optional[float] = Field(None, gt=0)
+    location_type: Optional[str] = None
+    location: Optional[str] = Field(None, max_length=500)
+    cover_image: Optional[str] = None
+    tags: List[str] = []
+    is_registration_open: bool = False
+    registration_link: Optional[str] = None
+    capacity: Optional[int] = Field(None, ge=0)
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_format(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not re.match(r"^\d{2}:\d{2}$", v):
+            raise ValueError("Time must be in HH:MM format")
+        h, m = map(int, v.split(":"))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("Invalid time value")
+        return v
+
+
+class ScrapedEventReject(CamelModel):
+    rejection_reason: Optional[str] = Field(None, max_length=500)
+
+
+class ScrapedEventImportStats(CamelModel):
+    imported: int
+    skipped: int
+    matched_clubs: int
+
+
+class ScrapedEventImportResponse(ApiResponse):
+    data: Optional[ScrapedEventImportStats] = None
