@@ -8,7 +8,10 @@ import shutil
 import uvicorn
 import fastapi
 import logging
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi import HTTPException, Query, FastAPI, File, UploadFile, status, Depends, Header, Request, Response, BackgroundTasks
@@ -27,6 +30,7 @@ from slowapi.errors import RateLimitExceeded
 
 from data import club_data, event_data
 import database, models, schemas, utils, storage
+from ratelimit import client_ip
 
 models.Base.metadata.create_all(bind=database.engine)
 
@@ -49,8 +53,8 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# request limiter
-limiter = Limiter(key_func=get_remote_address)
+# request limiter — keyed on the real client, not the proxy in front of us (see ratelimit.py)
+limiter = Limiter(key_func=client_ip)
 
 #create api
 api = FastAPI() # deploy trigger one more, another
@@ -71,6 +75,18 @@ api.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+
+# A 422 tells the caller which field failed but leaves no trace server-side, which makes
+# "the form won't save" reports impossible to diagnose. Log the offending fields and body.
+@api.exception_handler(RequestValidationError)
+async def log_validation_error(request: Request, exc: RequestValidationError):
+    fields = [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
+    logger.warning(
+        "422 %s %s — %s | body=%s",
+        request.method, request.url.path, "; ".join(fields), exc.body,
+    )
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
@@ -96,11 +112,20 @@ def get_week_range(ref_date_str: str) -> Tuple[datetime, datetime]:
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-# helper    
+# helper
 async def verify_api_key(x_api_key: str = Header(None)):
     if x_api_key != VALID_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
-    
+
+
+# helper
+def require_admin(current_user: models.User = Depends(utils.get_current_user)) -> models.User:
+    # role comes back as the UserRole enum member; str() would give "UserRole.ADMIN"
+    if current_user.role != models.UserRole.ADMIN.value:
+        raise HTTPException(status_code=403, detail="Admin only")
+    return current_user
+
+
 # helper
 def revalidate_frontend(tags: list[str]):
     """
@@ -172,7 +197,8 @@ def map_club_to_response(club: models.User) -> schemas.ClubResponse:
             banner_url= club.banner_url,
             is_verified=bool(club.is_verified),
             role=str(club.role),
-            rejection_reason=str(club.rejection_reason)
+            rejection_reason=str(club.rejection_reason),
+            ig_username=club.ig_username,
         )
 
 
@@ -193,7 +219,7 @@ async def health_check():
 
 # main page request to get events
 @api.get("/events/weekly", response_model=schemas.MultiEventResponse)
-@limiter.limit("10/minute") # Only 10 requests allowed per IP per minute
+@limiter.limit("60/minute")  # a visitor paging through weeks makes several requests a minute
 async def weekly_events(
     request: Request,
     response: Response,
@@ -748,6 +774,14 @@ async def update_club(
     if club_update.banner_url is not None:
         club.banner_url = club_update.banner_url
 
+    # Controls which scraped Instagram events attach to this club — admin decides.
+    # Unlike the fields above, an explicit null here *clears* the handle (omit it to leave it alone).
+    if "ig_username" in club_update.model_fields_set:
+        if current_user.role != models.UserRole.ADMIN.value:
+            raise HTTPException(status_code=403, detail="Only an admin can set the Instagram username")
+        handle = (club_update.ig_username or "").lstrip("@").strip()
+        club.ig_username = handle or None
+
     # 3. Commit to Database
     try:
         db.commit()
@@ -911,10 +945,12 @@ async def update_event(
     # Registration Logic (Update these too!)
     if event_update.is_registration_open is not None: 
         db_event.is_registration_open = event_update.is_registration_open
-    if event_update.registration_link is not None: 
-        db_event.registration_link = event_update.registration_link
-    if event_update.capacity is not None: 
-        db_event.capacity = event_update.capacity
+    if event_update.registration_link is not None:
+        # An empty field in the form arrives as "", which should clear the link, not store "".
+        db_event.registration_link = event_update.registration_link or None
+    if event_update.capacity is not None:
+        # 0 is "no limit"; store it as NULL so responses and the DB agree on what empty means.
+        db_event.capacity = event_update.capacity or None
 
     try:
         db.commit()
@@ -1665,3 +1701,490 @@ if __name__ == "__main__":
         port=port,
         reload=(environment == "development")  # Only reload in dev mode
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin approval inbox: candidate events awaiting review before they go public.
+# What fills the staging table is external — see pipeline_import.py where installed.
+# ---------------------------------------------------------------------------
+
+DEFAULT_DURATION_HOURS = 2.0
+DEFAULT_LOCATION_TYPE = models.LocationType.ON_CAMPUS.value
+# Instagram CDN URLs are signed and expire within days, so a published event must never
+# point at one — the image is copied into our own storage at approval time.
+MAX_REHOST_BYTES = 15 * 1024 * 1024
+
+
+# --- helpers ---------------------------------------------------------------
+
+def map_scraped_to_response(
+    row: models.ScrapedEvent, club_is_remembered: bool = False
+) -> schemas.ScrapedEventResponse:
+    return schemas.ScrapedEventResponse(
+        id=str(row.id),
+        source=str(row.source),
+        source_event_id=str(row.source_event_id),
+        club_username=row.club_username,
+        post_shortcode=row.post_shortcode,
+        post_url=row.post_url,
+        post_caption=row.post_caption,
+        post_image_url=row.post_image_url,
+        posted_at=row.posted_at,
+        title=row.title,
+        date=row.date,
+        location=row.location,
+        description=row.description,
+        confidence=float(row.confidence or 0.0),
+        status=_status(row),
+        rejection_reason=row.rejection_reason,
+        reviewed_at=row.reviewed_at,
+        club_id=row.club_id,
+        club_name=row.club.club_name if row.club else None,
+        club_is_remembered=club_is_remembered,
+        created_event_id=row.created_event_id,
+        created_at=row.created_at,
+    )
+
+
+def _unique_slug(db: Session, base: str) -> str:
+    slug = models.generate_slug(base) or "event"
+    candidate, n = slug, 2
+    while db.execute(select(models.Event.id).where(models.Event.slug == candidate)).first():
+        candidate = f"{slug}-{n}"
+        n += 1
+    return candidate
+
+
+def _add_hours(hhmm: str, hours: float) -> str:
+    h, m = map(int, hhmm.split(":"))
+    total = (h * 60 + m + int(round(hours * 60))) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _status(row: models.ScrapedEvent) -> str:
+    """Status comes back as the enum member or a plain string depending on the driver."""
+    return getattr(row.status, "value", row.status)
+
+
+def rehost_image(source_url: str, shortcode: str) -> Optional[str]:
+    """Copy a source image into Supabase Storage and return the public URL.
+
+    Returns None if anything goes wrong — approval must not fail because an image could
+    not be fetched; the caller falls back to the original URL and logs it.
+    """
+    try:
+        r = requests.get(source_url, timeout=30, stream=True)
+        r.raise_for_status()
+
+        declared = r.headers.get("content-length")
+        if declared and int(declared) > MAX_REHOST_BYTES:
+            logger.info("scraped events: image too large to re-host (%s bytes)", declared)
+            return None
+
+        content = b""
+        for chunk in r.iter_content(chunk_size=64 * 1024):
+            content += chunk
+            if len(content) > MAX_REHOST_BYTES:
+                logger.info("scraped events: image exceeded %d bytes, aborting", MAX_REHOST_BYTES)
+                return None
+
+        compressed, ext = storage.compress_image(content)
+        filename = f"scraped/{shortcode}-{uuid.uuid4().hex[:8]}.{ext}"
+        return storage.upload_to_supabase(compressed, filename, f"image/{ext}")
+    except Exception as e:
+        logger.info("scraped events: could not re-host %s: %s", source_url, e)
+        return None
+
+
+def resolve_publisher(db: Session, club_username: str) -> Optional[models.User]:
+    """Which user does this Instagram handle publish under?
+
+    A remembered mapping (set by the admin in the panel) wins; otherwise fall back to a
+    club that has declared the handle as its own. Returns None when the handle is unknown —
+    the row then shows up unmatched and waits for the admin to choose.
+    """
+    mapping = (
+        db.query(models.IgClubMapping)
+        .filter(models.IgClubMapping.club_username == club_username)
+        .first()
+    )
+    if mapping and mapping.user:
+        return mapping.user
+    return db.query(models.User).filter(models.User.ig_username == club_username).first()
+
+
+def remember_publisher(db: Session, club_username: str, user_id: str) -> None:
+    """Persist the admin's choice so the next post from this handle arrives pre-filled.
+
+    Always overwritable — the admin can pick a different club on a later row and that
+    becomes the new default. Does not commit; the caller owns the transaction.
+    """
+    mapping = (
+        db.query(models.IgClubMapping)
+        .filter(models.IgClubMapping.club_username == club_username)
+        .first()
+    )
+    if mapping:
+        if mapping.user_id != user_id:
+            mapping.user_id = user_id
+    else:
+        db.add(models.IgClubMapping(club_username=club_username, user_id=user_id))
+
+
+def _has_mapping(db: Session, club_username: str) -> bool:
+    return (
+        db.query(models.IgClubMapping.id)
+        .filter(models.IgClubMapping.club_username == club_username)
+        .first()
+        is not None
+    )
+
+
+def _get_or_404(db: Session, scraped_id: str) -> models.ScrapedEvent:
+    row = db.query(models.ScrapedEvent).filter(models.ScrapedEvent.id == scraped_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Scraped event not found")
+    return row
+
+
+# --- endpoints -------------------------------------------------------------
+
+@api.post("/admin/scraped-events/import", response_model=schemas.ScrapedEventImportResponse)
+async def import_scraped_events(
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Pull newly extracted events out of the pipeline DB into the approval inbox."""
+    # The scraping pipeline is local-only: the module is absent on the deployed server, and
+    # importing it lazily also keeps it free to import from this one.
+    try:
+        from pipeline_import import import_from_pipeline
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="The scraping pipeline is not installed on this server — run the importer locally",
+        )
+
+    try:
+        stats = import_from_pipeline(db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in import scraped events: %s", e)
+        raise HTTPException(status_code=500, detail="Could not import scraped events")
+
+    return schemas.ScrapedEventImportResponse(success=True, data=stats)
+
+
+@api.get("/admin/scraped-events", response_model=schemas.MultiScrapedEventResponse)
+async def list_scraped_events(
+    status: str = Query("pending"),
+    club_id: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Inbox listing. `status` accepts pending / approved / rejected / all."""
+    valid = {s.value for s in models.ScrapedEventStatus} | {"all"}
+    if status not in valid:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(valid)}")
+
+    base_query = select(models.ScrapedEvent)
+    if status != "all":
+        base_query = base_query.where(models.ScrapedEvent.status == status)
+    if club_id:
+        base_query = base_query.where(models.ScrapedEvent.club_id == club_id)
+
+    try:
+        total = db.execute(select(func.count()).select_from(base_query.subquery())).scalar()
+        query = (
+            base_query.order_by(
+                desc(models.ScrapedEvent.confidence), asc(models.ScrapedEvent.date)
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        rows = db.execute(query).scalars().all()
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in list scraped events: %s", e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    remembered = {
+        m.club_username
+        for m in db.query(models.IgClubMapping.club_username).all()
+    }
+    return schemas.MultiScrapedEventResponse(
+        success=True,
+        data=[
+            map_scraped_to_response(r, r.club_username in remembered) for r in rows
+        ],
+        pagination=paginate(page, page_size, total),
+    )
+
+
+@api.get("/admin/scraped-events/{scraped_id}", response_model=schemas.SingleScrapedEventResponse)
+async def get_scraped_event(
+    scraped_id: str,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    row = _get_or_404(db, scraped_id)
+    return schemas.SingleScrapedEventResponse(
+        success=True, data=map_scraped_to_response(row, _has_mapping(db, row.club_username))
+    )
+
+
+@api.patch("/admin/scraped-events/{scraped_id}", response_model=schemas.SingleScrapedEventResponse)
+async def update_scraped_event(
+    scraped_id: str,
+    payload: schemas.ScrapedEventUpdate,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Fix what the extractor got wrong (or attach the club) before approving."""
+    row = _get_or_404(db, scraped_id)
+    if _status(row) == models.ScrapedEventStatus.APPROVED.value:
+        raise HTTPException(status_code=409, detail="Already approved — edit the published event instead")
+
+    updates = payload.model_dump(exclude_unset=True)
+    if "club_id" in updates and updates["club_id"] is not None:
+        if not db.query(models.User).filter(models.User.id == updates["club_id"]).first():
+            raise HTTPException(status_code=404, detail="Club not found")
+
+    for field, value in updates.items():
+        setattr(row, field, value)
+
+    # Picking a club here teaches the mapping, so the next post from this handle arrives set.
+    if updates.get("club_id"):
+        remember_publisher(db, row.club_username, updates["club_id"])
+
+    try:
+        db.commit()
+        db.refresh(row)
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in update scraped event: %s", e)
+        raise HTTPException(status_code=500, detail="Could not update scraped event")
+
+    return schemas.SingleScrapedEventResponse(
+        success=True, data=map_scraped_to_response(row, _has_mapping(db, row.club_username))
+    )
+
+
+@api.post("/admin/scraped-events/{scraped_id}/approve", response_model=schemas.SingleEventResponse)
+async def approve_scraped_event(
+    scraped_id: str,
+    payload: schemas.ScrapedEventApprove,
+    bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Publish a staged event: creates the real Event and marks the staging row approved."""
+    row = _get_or_404(db, scraped_id)
+    if _status(row) == models.ScrapedEventStatus.APPROVED.value:
+        raise HTTPException(status_code=409, detail="Scraped event already approved")
+
+    # publishAsAdmin covers handles whose club is not on the platform, or does not want
+    # its name on the listing — the event goes out under the admin account instead.
+    club_id = current_user.id if payload.publish_as_admin else (payload.club_id or row.club_id)
+    if not club_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No club linked to @{row.club_username} — set clubId, or pass "
+                "publishAsAdmin to publish it under the admin account"
+            ),
+        )
+    club = db.query(models.User).filter(models.User.id == club_id).first()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club not found")
+
+    # Date: admin override wins, else the extracted timestamp.
+    event_date = payload.date or (row.date.date() if row.date else None)
+    if not event_date:
+        raise HTTPException(status_code=400, detail="No date on this event — set date before approving")
+
+    title = payload.title or row.title
+    if not title:
+        raise HTTPException(status_code=400, detail="No title on this event — set title before approving")
+
+    location = payload.location or row.location
+    if not location:
+        raise HTTPException(status_code=400, detail="No location on this event — set location before approving")
+
+    # Time: the extractor only knows a timestamp, so fall back to its time-of-day.
+    start_time = payload.start_time or (row.date.strftime("%H:%M") if row.date else "00:00")
+    duration = payload.duration or DEFAULT_DURATION_HOURS
+    end_time = payload.end_time or _add_hours(start_time, duration)
+
+    location_type = payload.location_type or DEFAULT_LOCATION_TYPE
+    if location_type not in {t.value for t in models.LocationType}:
+        raise HTTPException(status_code=400, detail="Invalid locationType")
+
+    # A custom cover typed by the admin is taken as-is; the scraped post image is copied
+    # into our storage first, so the published event does not rot when the CDN link expires.
+    if payload.cover_image:
+        cover_image = payload.cover_image
+    elif row.post_image_url:
+        cover_image = rehost_image(row.post_image_url, row.post_shortcode) or row.post_image_url
+        if cover_image == row.post_image_url:
+            logger.info(
+                "[%s] re-host failed — publishing with the source URL, which may expire",
+                row.post_shortcode,
+            )
+    else:
+        cover_image = None
+
+    db_event = models.Event(
+        slug=_unique_slug(db, f"{title} {event_date}"),
+        title=title,
+        description=payload.description or row.description or "",
+        club_id=club.id,
+        date=event_date,
+        start_time=start_time,
+        end_time=end_time,
+        duration=duration,
+        location_type=location_type,
+        location=location,
+        cover_image=cover_image,
+        tags=",".join(payload.tags) if payload.tags else "",
+        is_registration_open=payload.is_registration_open,
+        registration_link=payload.registration_link,
+        capacity=payload.capacity,
+    )
+
+    try:
+        db.add(db_event)
+        db.flush()
+
+        # Remember the choice — including "publish as admin" — for this handle's next post.
+        remember_publisher(db, row.club_username, club.id)
+
+        row.status = models.ScrapedEventStatus.APPROVED
+        row.club_id = club.id
+        row.created_event_id = db_event.id
+        row.reviewed_at = dt.datetime.utcnow()
+        row.reviewed_by = current_user.id
+        row.rejection_reason = None
+
+        db.commit()
+        db.refresh(db_event)
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in approve scraped event: %s", e)
+        raise HTTPException(status_code=500, detail="Could not publish event")
+
+    bg_tasks.add_task(revalidate_frontend, ["events"])
+    return schemas.SingleEventResponse(success=True, data=map_event_to_response(db_event))
+
+
+@api.post("/admin/scraped-events/{scraped_id}/reject", response_model=schemas.SingleScrapedEventResponse)
+async def reject_scraped_event(
+    scraped_id: str,
+    payload: schemas.ScrapedEventReject,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    row = _get_or_404(db, scraped_id)
+    if _status(row) == models.ScrapedEventStatus.APPROVED.value:
+        raise HTTPException(status_code=409, detail="Already approved — delete the published event instead")
+
+    row.status = models.ScrapedEventStatus.REJECTED
+    row.rejection_reason = payload.rejection_reason
+    row.reviewed_at = dt.datetime.utcnow()
+    row.reviewed_by = current_user.id
+
+    try:
+        db.commit()
+        db.refresh(row)
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in reject scraped event: %s", e)
+        raise HTTPException(status_code=500, detail="Could not reject scraped event")
+
+    return schemas.SingleScrapedEventResponse(success=True, data=map_scraped_to_response(row))
+
+
+@api.delete("/admin/scraped-events/{scraped_id}", response_model=schemas.ApiResponse)
+async def delete_scraped_event(
+    scraped_id: str,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Drop a staging row. The published event, if any, is left untouched."""
+    row = _get_or_404(db, scraped_id)
+    try:
+        db.delete(row)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in delete scraped event: %s", e)
+        raise HTTPException(status_code=500, detail="Could not delete scraped event")
+
+    return schemas.ApiResponse(success=True)
+
+
+# --- remembered handle → publisher mappings -------------------------------
+
+@api.get("/admin/ig-club-mappings", response_model=schemas.MultiIgClubMappingResponse)
+async def list_ig_club_mappings(
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Which Instagram handle publishes under which account, as learned from approvals."""
+    rows = (
+        db.query(models.IgClubMapping)
+        .order_by(asc(models.IgClubMapping.club_username))
+        .all()
+    )
+    return schemas.MultiIgClubMappingResponse(
+        success=True,
+        data=[
+            schemas.IgClubMappingResponse(
+                club_username=m.club_username,
+                user_id=m.user_id,
+                user_name=m.user.club_name if m.user else "(deleted)",
+                is_admin=bool(m.user and m.user.role == models.UserRole.ADMIN.value),
+                updated_at=m.updated_at,
+            )
+            for m in rows
+        ],
+    )
+
+
+@api.delete("/admin/ig-club-mappings/{club_username}", response_model=schemas.ApiResponse)
+async def delete_ig_club_mapping(
+    club_username: str,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Forget a handle's publisher. Already-staged rows keep whatever club they have."""
+    mapping = (
+        db.query(models.IgClubMapping)
+        .filter(models.IgClubMapping.club_username == club_username.lstrip("@"))
+        .first()
+    )
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+
+    try:
+        db.delete(mapping)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in delete ig club mapping: %s", e)
+        raise HTTPException(status_code=500, detail="Could not delete mapping")
+
+    return schemas.ApiResponse(success=True)

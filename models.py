@@ -56,6 +56,8 @@ class User(Base):
         default=UserRole.CLUB
     )
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Instagram handle scraped events are matched against (ig_pipeline posts.club_username)
+    ig_username: Mapped[Optional[str]] = mapped_column(String, nullable=True, unique=True, index=True)
     rejection_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True, default=None)
     
     # Relationships
@@ -225,3 +227,82 @@ class Contact(Base):
 
     class Config:
         from_attributes = True
+
+class ScrapedEventStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ScrapedEvent(Base):
+    """Event extracted from a scraped Instagram post, waiting for admin approval.
+
+    Rows are imported from the ig_pipeline database. Approving one creates a real Event;
+    the staging row keeps the link so the same post is never published twice.
+    """
+    __tablename__ = "scraped_events"
+    __table_args__ = (
+        UniqueConstraint("source", "source_event_id", name="uq_scraped_source_event"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+
+    # Provenance
+    source: Mapped[str] = mapped_column(String, default="instagram", index=True)
+    source_event_id: Mapped[str] = mapped_column(String, index=True)  # Event.id in ig_pipeline.db
+    club_username: Mapped[str] = mapped_column(String, index=True)
+    post_shortcode: Mapped[str] = mapped_column(String, index=True)
+    post_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    post_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    post_image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    posted_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Extracted content (editable by the admin before approval)
+    title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    location: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+
+    # Review state
+    status: Mapped[str] = mapped_column(
+        SQLEnum(ScrapedEventStatus), nullable=False, default=ScrapedEventStatus.PENDING, index=True
+    )
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    reviewed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String, ForeignKey("users.id"), nullable=True)
+
+    # Resolved club (auto-matched on ig_username, or picked by the admin)
+    club_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("users.id"), nullable=True, index=True)
+    # Set once approved
+    created_event_id: Mapped[Optional[str]] = mapped_column(
+        String, ForeignKey("events.id", ondelete="SET NULL"), nullable=True
+    )
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=datetime.datetime.utcnow, index=True
+    )
+
+    club = relationship("User", foreign_keys=[club_id])
+    created_event = relationship("Event", foreign_keys=[created_event_id])
+
+
+class IgClubMapping(Base):
+    """Remembers which app user an Instagram handle publishes under.
+
+    Learned from the admin's choice in the approval panel, so a handle only has to be
+    resolved once. Distinct from `User.ig_username` (which is a club declaring its own
+    handle) because the target may be the admin account, and the admin publishes for
+    many handles — one unique column on `users` cannot express that.
+    """
+    __tablename__ = "ig_club_mappings"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    club_username: Mapped[str] = mapped_column(String, unique=True, index=True)
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow
+    )
+
+    user = relationship("User")

@@ -55,3 +55,16 @@ uploads/*
 
 # Secrets
 real_secrets.txt
+
+# Database backups and table dumps (db_dump/ contains real subscriber emails)
+*.db.bak*
+*.bak-premigration
+db_dump/
+
+# Instagram scraping + extraction pipeline — kept local for now.
+# The admin approval API in main.py works without these; only the import endpoint is
+# disabled (503) when pipeline_import.py is absent, which is the case on the server.
+ig_pipeline/
+run_real_test.sh
+pipeline_import.py
+import_scraped_events.py
