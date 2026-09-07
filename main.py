@@ -31,6 +31,7 @@ from slowapi.errors import RateLimitExceeded
 from data import club_data, event_data
 import database, models, schemas, utils, storage
 from ratelimit import client_ip
+from post_sources import source_details
 
 models.Base.metadata.create_all(bind=database.engine)
 
@@ -163,12 +164,14 @@ def get_visitor_id(request: Request) -> Optional[str]:
 # helper
 def map_event_to_response(event: models.Event, has_liked: bool = False) -> schemas.EventResponse:
     """Convert Event model to EventResponse schema."""
+    source_url, description = source_details(event.source_posts, event.description)
     return schemas.EventResponse(
+        source_post_url=source_url,
         id=str(event.id),
         club_id=str(event.club_id),
         club_name=event.owner.club_name if event.owner else "Unknown",
         title=event.title,
-        description=event.description,
+        description=description,
         date=event.date,
         start_time=event.start_time,
         end_time=event.end_time,
@@ -1126,12 +1129,14 @@ async def handle_event_like(
 # ==================== ANNOUNCEMENTS ====================
 
 def map_announcement_to_response(a: models.Announcement) -> schemas.AnnouncementResponse:
+    source_url, body = source_details(a.source_posts, a.body)
     return schemas.AnnouncementResponse(
+        source_post_url=source_url,
         id=str(a.id),
         club_id=str(a.club_id),
         club_name=a.owner.club_name if a.owner else "Unknown",
         title=a.title,
-        body=a.body,
+        body=body,
         cover_image=a.cover_image,
         link=a.link,
         tags=list(a.tags.split(",")) if a.tags else [],
