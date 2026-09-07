@@ -1724,6 +1724,7 @@ def map_scraped_to_response(
         id=str(row.id),
         source=str(row.source),
         source_event_id=str(row.source_event_id),
+        kind=str(row.kind or "event"),
         club_username=row.club_username,
         post_shortcode=row.post_shortcode,
         post_url=row.post_url,
@@ -1735,6 +1736,9 @@ def map_scraped_to_response(
         location=row.location,
         description=row.description,
         confidence=float(row.confidence or 0.0),
+        category=row.category,
+        link=row.link,
+        expires_at=row.expires_at,
         status=_status(row),
         rejection_reason=row.rejection_reason,
         reviewed_at=row.reviewed_at,
@@ -1742,6 +1746,7 @@ def map_scraped_to_response(
         club_name=row.club.club_name if row.club else None,
         club_is_remembered=club_is_remembered,
         created_event_id=row.created_event_id,
+        created_announcement_id=row.created_announcement_id,
         created_at=row.created_at,
     )
 
@@ -1750,6 +1755,15 @@ def _unique_slug(db: Session, base: str) -> str:
     slug = models.generate_slug(base) or "event"
     candidate, n = slug, 2
     while db.execute(select(models.Event.id).where(models.Event.slug == candidate)).first():
+        candidate = f"{slug}-{n}"
+        n += 1
+    return candidate
+
+
+def _unique_announcement_slug(db: Session, base: str) -> str:
+    slug = models.generate_slug(base) or "announcement"
+    candidate, n = slug, 2
+    while db.execute(select(models.Announcement.id).where(models.Announcement.slug == candidate)).first():
         candidate = f"{slug}-{n}"
         n += 1
     return candidate
@@ -1772,6 +1786,9 @@ def rehost_image(source_url: str, shortcode: str) -> Optional[str]:
     Returns None if anything goes wrong — approval must not fail because an image could
     not be fetched; the caller falls back to the original URL and logs it.
     """
+    public_prefix = f"{storage.SUPABASE_URL}/storage/v1/object/public/{storage.STORAGE_BUCKET}/"
+    if storage.SUPABASE_URL and source_url.startswith(public_prefix):
+        return source_url
     try:
         r = requests.get(source_url, timeout=30, stream=True)
         r.raise_for_status()
@@ -1881,6 +1898,7 @@ async def import_scraped_events(
 @api.get("/admin/scraped-events", response_model=schemas.MultiScrapedEventResponse)
 async def list_scraped_events(
     status: str = Query("pending"),
+    kind: Optional[str] = Query(None, description='"event" or "announcement"'),
     club_id: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -1893,9 +1911,14 @@ async def list_scraped_events(
     if status not in valid:
         raise HTTPException(status_code=400, detail=f"status must be one of {sorted(valid)}")
 
+    if kind and kind not in ("event", "announcement"):
+        raise HTTPException(status_code=400, detail='kind must be "event" or "announcement"')
+
     base_query = select(models.ScrapedEvent)
     if status != "all":
         base_query = base_query.where(models.ScrapedEvent.status == status)
+    if kind:
+        base_query = base_query.where(models.ScrapedEvent.kind == kind)
     if club_id:
         base_query = base_query.where(models.ScrapedEvent.club_id == club_id)
 
@@ -1991,6 +2014,12 @@ async def approve_scraped_event(
     row = _get_or_404(db, scraped_id)
     if _status(row) == models.ScrapedEventStatus.APPROVED.value:
         raise HTTPException(status_code=409, detail="Scraped event already approved")
+    if row.kind == "announcement":
+        raise HTTPException(
+            status_code=400,
+            detail="This candidate is an announcement — approve it at "
+                   "/admin/scraped-events/{id}/approve-announcement",
+        )
 
     # publishAsAdmin covers handles whose club is not on the platform, or does not want
     # its name on the listing — the event goes out under the admin account instead.
@@ -2084,6 +2113,99 @@ async def approve_scraped_event(
 
     bg_tasks.add_task(revalidate_frontend, ["events"])
     return schemas.SingleEventResponse(success=True, data=map_event_to_response(db_event))
+
+
+@api.post("/admin/scraped-events/{scraped_id}/approve-announcement",
+          response_model=schemas.SingleAnnouncementResponse)
+async def approve_scraped_announcement(
+    scraped_id: str,
+    payload: schemas.ScrapedAnnouncementApprove,
+    bg_tasks: BackgroundTasks,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Publish a staged announcement: creates the real Announcement and marks the row approved."""
+    row = _get_or_404(db, scraped_id)
+    if _status(row) == models.ScrapedEventStatus.APPROVED.value:
+        raise HTTPException(status_code=409, detail="Scraped candidate already approved")
+    if row.kind != "announcement":
+        raise HTTPException(
+            status_code=400,
+            detail="This candidate is an event — approve it at "
+                   "/admin/scraped-events/{id}/approve",
+        )
+
+    club_id = current_user.id if payload.publish_as_admin else (payload.club_id or row.club_id)
+    if not club_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No club linked to @{row.club_username} — set clubId, or pass "
+                "publishAsAdmin to publish it under the admin account"
+            ),
+        )
+    club = db.query(models.User).filter(models.User.id == club_id).first()
+    if not club:
+        raise HTTPException(status_code=404, detail="Club not found")
+
+    title = payload.title or row.title
+    if not title:
+        raise HTTPException(status_code=400, detail="No title on this announcement — set title before approving")
+
+    body = payload.body or row.description
+    if not body:
+        raise HTTPException(status_code=400, detail="No body on this announcement — set body before approving")
+
+    category = payload.category or row.category or models.AnnouncementCategory.GENERAL.value
+    if category not in {c.value for c in models.AnnouncementCategory}:
+        raise HTTPException(status_code=400, detail="Invalid category")
+
+    # Same reasoning as events: a custom cover is taken as-is, the post image is copied into
+    # our storage so the published announcement does not rot when the CDN link expires.
+    if payload.cover_image:
+        cover_image = payload.cover_image
+    elif row.post_image_url:
+        cover_image = rehost_image(row.post_image_url, row.post_shortcode) or row.post_image_url
+    else:
+        cover_image = None
+
+    db_announcement = models.Announcement(
+        slug=_unique_announcement_slug(db, title),
+        title=title,
+        body=body,
+        cover_image=cover_image,
+        link=payload.link or row.link,
+        tags=",".join(payload.tags) if payload.tags else "",
+        category=category,
+        is_pinned=payload.is_pinned,
+        expires_at=payload.expires_at or row.expires_at,
+        club_id=club.id,
+    )
+
+    try:
+        db.add(db_announcement)
+        db.flush()
+
+        remember_publisher(db, row.club_username, club.id)
+        row.status = models.ScrapedEventStatus.APPROVED
+        row.club_id = club.id
+        row.created_announcement_id = db_announcement.id
+        row.reviewed_at = dt.datetime.utcnow()
+        row.reviewed_by = current_user.id
+        row.rejection_reason = None
+
+        db.commit()
+        db.refresh(db_announcement)
+    except Exception as e:
+        db.rollback()
+        logger.info("Exception occured in approve scraped announcement: %s", e)
+        raise HTTPException(status_code=500, detail="Could not publish announcement")
+
+    bg_tasks.add_task(revalidate_frontend, ["announcements"])
+    return schemas.SingleAnnouncementResponse(
+        success=True, data=map_announcement_to_response(db_announcement)
+    )
 
 
 @api.post("/admin/scraped-events/{scraped_id}/reject", response_model=schemas.SingleScrapedEventResponse)

@@ -301,6 +301,8 @@ class ScrapedEventResponse(CamelModel):
     id: str
     source: str
     source_event_id: str
+    # "event" or "announcement" — decides which form the panel shows and what approval creates
+    kind: str
 
     # Source post context, so the admin can judge without leaving the panel
     club_username: str
@@ -317,6 +319,11 @@ class ScrapedEventResponse(CamelModel):
     description: Optional[str] = None
     confidence: float
 
+    # Announcements only
+    category: Optional[str] = None
+    link: Optional[str] = None
+    expires_at: Optional[datetime.date] = None
+
     # Review state
     status: str
     rejection_reason: Optional[str] = None
@@ -326,6 +333,7 @@ class ScrapedEventResponse(CamelModel):
     # true when club_id came from a remembered handle mapping rather than a fresh guess
     club_is_remembered: bool = False
     created_event_id: Optional[str] = None
+    created_announcement_id: Optional[str] = None
     created_at: datetime.datetime
 
 
@@ -340,11 +348,22 @@ class MultiScrapedEventResponse(ApiResponse):
 
 class ScrapedEventUpdate(CamelModel):
     """Admin fixes to the extracted content before approving."""
+    kind: Optional[str] = None
     title: Optional[str] = Field(None, max_length=200)
     date: Optional[datetime.datetime] = None
     location: Optional[str] = Field(None, max_length=500)
     description: Optional[str] = Field(None, max_length=5000)
+    category: Optional[str] = None
+    link: Optional[str] = Field(None, max_length=500)
+    expires_at: Optional[datetime.date] = None
     club_id: Optional[str] = None
+
+    @field_validator("kind")
+    @classmethod
+    def validate_kind(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("event", "announcement"):
+            raise ValueError('kind must be "event" or "announcement"')
+        return v
 
 
 class IgClubMappingResponse(CamelModel):
@@ -394,6 +413,20 @@ class ScrapedEventApprove(CamelModel):
         if not (0 <= h <= 23 and 0 <= m <= 59):
             raise ValueError("Invalid time value")
         return v
+
+
+class ScrapedAnnouncementApprove(CamelModel):
+    """Publishing a staged announcement. Everything optional; extracted values fill the gaps."""
+    club_id: Optional[str] = None
+    publish_as_admin: bool = False
+    title: Optional[str] = Field(None, max_length=200)
+    body: Optional[str] = Field(None, max_length=5000)
+    category: Optional[str] = None
+    link: Optional[str] = Field(None, max_length=500)
+    cover_image: Optional[str] = None
+    tags: List[str] = []
+    is_pinned: bool = False
+    expires_at: Optional[datetime.date] = None
 
 
 class ScrapedEventReject(CamelModel):

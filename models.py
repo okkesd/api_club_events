@@ -257,12 +257,20 @@ class ScrapedEvent(Base):
     post_image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     posted_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
 
+    # What this candidate becomes when approved: an Event or an Announcement.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="event", index=True)
+
     # Extracted content (editable by the admin before approval)
     title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True, index=True)
     location: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
+
+    # Announcement-only fields; null on events
+    category: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    link: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    expires_at: Mapped[Optional[datetime.date]] = mapped_column(Date, nullable=True)
 
     # Review state
     status: Mapped[str] = mapped_column(
@@ -274,9 +282,12 @@ class ScrapedEvent(Base):
 
     # Resolved club (auto-matched on ig_username, or picked by the admin)
     club_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("users.id"), nullable=True, index=True)
-    # Set once approved
+    # Set once approved — one of the two, matching `kind`
     created_event_id: Mapped[Optional[str]] = mapped_column(
         String, ForeignKey("events.id", ondelete="SET NULL"), nullable=True
+    )
+    created_announcement_id: Mapped[Optional[str]] = mapped_column(
+        String, ForeignKey("announcements.id", ondelete="SET NULL"), nullable=True
     )
 
     created_at: Mapped[datetime.datetime] = mapped_column(
@@ -285,6 +296,7 @@ class ScrapedEvent(Base):
 
     club = relationship("User", foreign_keys=[club_id])
     created_event = relationship("Event", foreign_keys=[created_event_id])
+    created_announcement = relationship("Announcement", foreign_keys=[created_announcement_id])
 
 
 class IgClubMapping(Base):
