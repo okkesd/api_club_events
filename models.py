@@ -97,6 +97,7 @@ class Event(Base):
     # Relationships
     club_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"))
     owner = relationship("User", back_populates="events")
+    source_posts = relationship("ScrapedEvent", foreign_keys="ScrapedEvent.created_event_id", viewonly=True, lazy="selectin")
 
     likes: Mapped[int] = mapped_column(Integer, default=0)
     view_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -213,6 +214,7 @@ class Announcement(Base):
     # Relationships
     club_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"))
     owner = relationship("User", back_populates="announcements")
+    source_posts = relationship("ScrapedEvent", foreign_keys="ScrapedEvent.created_announcement_id", viewonly=True, lazy="selectin")
 
 
 class Contact(Base):

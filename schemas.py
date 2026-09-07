@@ -184,6 +184,7 @@ class EventUpdate(CamelModel):
         return v
 
 class EventResponse(EventBase):
+    source_post_url: Optional[str] = None
     id: str
     club_id: str
     club_name: str  # Flattened from relation for easy UI access
@@ -230,6 +231,7 @@ class AnnouncementUpdate(CamelModel):
     expires_at: Optional[datetime.date] = None
 
 class AnnouncementResponse(AnnouncementBase):
+    source_post_url: Optional[str] = None
     id: str
     club_id: str
     club_name: str
