@@ -1560,7 +1560,9 @@ async def update_announcement(
 
     if update.title is not None: db_a.title = update.title
     if update.body is not None: db_a.body = update.body
-    if update.cover_image is not None: db_a.cover_image = update.cover_image
+    # Omitted means unchanged; explicit null means remove the cover.
+    if "cover_image" in update.model_fields_set:
+        db_a.cover_image = update.cover_image
     if update.link is not None: db_a.link = update.link
     if update.tags is not None: db_a.tags = ",".join(update.tags)
     if update.category is not None: db_a.category = update.category
