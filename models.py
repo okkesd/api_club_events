@@ -217,6 +217,28 @@ class Announcement(Base):
     source_posts = relationship("ScrapedEvent", foreign_keys="ScrapedEvent.created_announcement_id", viewonly=True, lazy="selectin")
 
 
+class DigestDelivery(Base):
+    """One durable delivery per subscriber and Istanbul calendar week."""
+    __tablename__ = "digest_deliveries"
+    __table_args__ = (
+        UniqueConstraint("week_start", "subscription_id", name="uq_digest_week_subscriber"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    week_start: Mapped[datetime.date] = mapped_column(Date, nullable=False, index=True)
+    subscription_id: Mapped[str] = mapped_column(String, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
+    recipient: Mapped[str] = mapped_column(String, nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    html_body: Mapped[str] = mapped_column(Text, nullable=False)
+    text_body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    attempted_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+    sent_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class Contact(Base):
     __tablename__ = "contact"
 
@@ -320,3 +342,30 @@ class IgClubMapping(Base):
     )
 
     user = relationship("User")
+
+
+class Suggestion(Base):
+    __tablename__ = "suggestions"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    kind = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="pending", index=True)
+    title = Column(String(200))
+    description = Column(Text)
+    date = Column(Date)
+    start_time = Column(String(5))
+    end_time = Column(String(5))
+    location = Column(String(500))
+    organizer = Column(String(500))
+    link = Column(String(2048))
+    category = Column(String)
+    expires_at = Column(Date)
+    email = Column(String(320))
+    image_url = Column(String)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    reviewed_at = Column(DateTime)
+    reviewed_by = Column(String, ForeignKey("users.id"))
+    rejection_reason = Column(Text)
+    created_event_id = Column(String, ForeignKey("events.id", ondelete="SET NULL"), unique=True)
+    created_announcement_id = Column(String, ForeignKey("announcements.id", ondelete="SET NULL"), unique=True)
