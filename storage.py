@@ -111,7 +111,7 @@ def list_storage_files(prefix: str = "", limit: int = 1000, offset: int = 0) -> 
 
 def cleanup_orphaned_images(db_session) -> dict:
     """Delete images from storage that aren't referenced by any event, announcement, or user."""
-    from models import Event, Announcement, User, ScrapedEvent
+    from models import Event, Announcement, User, ScrapedEvent, Suggestion
 
     # Collect all referenced image URLs from the database
     referenced_urls = set()
@@ -124,6 +124,9 @@ def cleanup_orphaned_images(db_session) -> dict:
     for url, in db_session.query(Announcement.cover_image).filter(Announcement.cover_image.isnot(None)).all():
         referenced_urls.add(url)
     for url, in db_session.query(User.logo_url).filter(User.logo_url.isnot(None)).all():
+        referenced_urls.add(url)
+
+    for url, in db_session.query(Suggestion.image_url).filter(Suggestion.image_url.isnot(None)).all():
         referenced_urls.add(url)
 
     # Extract just the filenames from referenced URLs

@@ -32,6 +32,7 @@ from data import club_data, event_data
 import database, models, schemas, utils, storage
 from ratelimit import client_ip
 from post_sources import source_details
+from newsletter import unsubscribe_by_token
 
 models.Base.metadata.create_all(bind=database.engine)
 
@@ -82,6 +83,9 @@ api.add_middleware(
 # "the form won't save" reports impossible to diagnose. Log the offending fields and body.
 @api.exception_handler(RequestValidationError)
 async def log_validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path == "/suggestions" or request.url.path.startswith("/admin/suggestions"):
+        errors = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
     fields = [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
     logger.warning(
         "422 %s %s — %s | body=%s",
@@ -1001,7 +1005,7 @@ async def delete_event(
     event_response = map_event_to_response(db_event)
 
     # 4. Clean up cover image from Supabase Storage
-    if db_event.cover_image:
+    if db_event.cover_image and not db.query(models.Suggestion.id).filter_by(image_url=db_event.cover_image).first():
         try:
             storage.delete_from_supabase(db_event.cover_image)
         except Exception:
@@ -1009,6 +1013,10 @@ async def delete_event(
 
     # 5. Delete from DB
     try:
+        # Also supports existing databases whose FK predates ON DELETE SET NULL.
+        db.query(models.Suggestion).filter_by(created_event_id=event_id).update(
+            {"created_event_id": None}, synchronize_session=False
+        )
         db.delete(db_event)
         db.commit()
         bg_tasks.add_task(revalidate_frontend, ["events"])
@@ -1367,27 +1375,7 @@ async def unsubscribe(
     Public endpoint. Unsubscribe via token (from email link).
     Works for both master tokens (deactivates everything) and per-club tokens.
     """
-    # Check master token first
-    sub = db.query(models.Subscription).filter(
-        models.Subscription.token == token
-    ).first()
-    if sub:
-        sub.is_active = False
-        for cs in sub.club_subscriptions:
-            cs.is_active = False
-        db.commit()
-        return {"success": True, "message": "Unsubscribed from all"}
-
-    # Check per-club token
-    cs = db.query(models.ClubSubscription).filter(
-        models.ClubSubscription.token == token
-    ).first()
-    if cs:
-        cs.is_active = False
-        db.commit()
-        return {"success": True, "message": "Unsubscribed from club"}
-
-    raise HTTPException(404, detail="Subscription not found")
+    return unsubscribe_by_token(db, token)
 
 
 @api.get("/admin/subscriptions", response_model=schemas.MultiSubscriptionResponse)
@@ -1617,13 +1605,16 @@ async def delete_announcement(
     response = map_announcement_to_response(db_a)
 
     # Clean up cover image from Supabase Storage
-    if db_a.cover_image:
+    if db_a.cover_image and not db.query(models.Suggestion.id).filter_by(image_url=db_a.cover_image).first():
         try:
             storage.delete_from_supabase(db_a.cover_image)
         except Exception:
             logger.info(f"Failed to delete announcement image: {db_a.cover_image}")
 
     try:
+        db.query(models.Suggestion).filter_by(created_announcement_id=announcement_id).update(
+            {"created_announcement_id": None}, synchronize_session=False
+        )
         db.delete(db_a)
         db.commit()
         bg_tasks.add_task(revalidate_frontend, ["announcements"])
@@ -2317,3 +2308,9 @@ async def delete_ig_club_mapping(
         raise HTTPException(status_code=500, detail="Could not delete mapping")
 
     return schemas.ApiResponse(success=True)
+
+
+# Anonymous suggestions use Bearer admin authorization without the legacy API-key gate.
+from suggestions import build_router as build_suggestions_router, SuggestionBodyLimit
+api.add_middleware(SuggestionBodyLimit)
+api.include_router(build_suggestions_router(require_admin, limiter, revalidate_frontend))
