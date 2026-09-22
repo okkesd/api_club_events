@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date, Integer, DateTime, UniqueConstraint
+from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date, Integer, DateTime, UniqueConstraint, Index
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from database import Base
@@ -104,6 +104,23 @@ class Event(Base):
 
     # Relationships
     event_likes = relationship("EventLike", back_populates="event", cascade="all, delete-orphan")
+    translations = relationship("EventTranslation", back_populates="event", cascade="all, delete-orphan")
+
+
+class EventTranslation(Base):
+    __tablename__ = "event_translations"
+    __table_args__ = (
+        UniqueConstraint("event_id", "target_language", "description_hash", name="uq_event_translation_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    event_id: Mapped[str] = mapped_column(String, ForeignKey("events.id", ondelete="CASCADE"))
+    target_language: Mapped[str] = mapped_column(String(2))
+    description_hash: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+
+    event = relationship("Event", back_populates="translations")
 
 
 class EventLike(Base):
@@ -369,3 +386,28 @@ class Suggestion(Base):
     rejection_reason = Column(Text)
     created_event_id = Column(String, ForeignKey("events.id", ondelete="SET NULL"), unique=True)
     created_announcement_id = Column(String, ForeignKey("announcements.id", ondelete="SET NULL"), unique=True)
+
+
+class MetricRecord(Base):
+    """Append-only history, deliberately independent of deletable content rows."""
+    __tablename__ = "metric_records"
+    __table_args__ = (Index("ix_metric_kind_time", "kind", "occurred_at"),)
+    id = Column(String, primary_key=True, default=generate_uuid)
+    kind = Column(String(40), nullable=False)
+    occurred_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    event_id = Column(String, index=True)
+    subject = Column(String)
+    club_id = Column(String)
+
+
+class MetricCoverage(Base):
+    __tablename__ = "metric_coverage"
+    name = Column(String, primary_key=True)
+    started_at = Column(DateTime, nullable=False)
+
+
+class MetricSubscriber(Base):
+    __tablename__ = "metric_subscribers"
+    email_hash = Column(String(64), primary_key=True)
+    # Null for pre-tracking subscribers: their original activation is unknown.
+    first_activated_at = Column(DateTime)

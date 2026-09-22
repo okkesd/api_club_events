@@ -74,12 +74,15 @@ jobs:
             cat > .env << 'ENVEOF'
             DATABASE_URL=${{ secrets.DATABASE_URL }}
             FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            
             API_SECRET_KEY=${{ secrets.API_SECRET_KEY }}
             REVALIDATION_TOKEN=${{ secrets.REVALIDATION_TOKEN }}
             JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
             JWT_EXPIRE_MINUTES=60
             ADMIN_EMAIL=${{ secrets.ADMIN_EMAIL }}
             ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
+            AZURE_KEY=${{ secrets.AZURE_KEY }}
+            AZURE_REGION=${{ secrets.AZURE_REGION }}
             SUPABASE_URL=${{ secrets.SUPABASE_URL }}
             SUPABASE_SERVICE_KEY=${{ secrets.SUPABASE_SERVICE_KEY }}
             STORAGE_BUCKET=${{ secrets.STORAGE_BUCKET }}

@@ -8,6 +8,11 @@ services:
       - ENVIRONMENT=production
       - BACKEND_PORT=4444
       - FRONTEND_URL=${FRONTEND_URL}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
       - API_SECRET_KEY=${API_SECRET_KEY}
       - NEXTJS_APP_URL=${FRONTEND_URL}
       - REVALIDATION_TOKEN=${REVALIDATION_TOKEN}
@@ -18,6 +23,8 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - STORAGE_BUCKET=${STORAGE_BUCKET:-event-images}
+      - AZURE_KEY=${AZURE_KEY:-}
+      - AZURE_REGION=${AZURE_REGION:-}
     networks:
       - app-network
     healthcheck:
@@ -70,4 +77,3 @@ services:
 networks:
   app-network:
     driver: bridge
-
