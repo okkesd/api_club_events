@@ -83,6 +83,9 @@ jobs:
             ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
             AZURE_KEY=${{ secrets.AZURE_KEY }}
             AZURE_REGION=${{ secrets.AZURE_REGION }}
+            SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY=${{ secrets.SUPABASE_SERVICE_KEY }}
+            STORAGE_BUCKET=${{ secrets.STORAGE_BUCKET }}
             ENVEOF
             
             # Pull the new backend image we just pushed
