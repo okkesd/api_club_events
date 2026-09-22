@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
-from typing import Optional, List
+from typing import Optional, List, Literal
 import datetime
 import re
 import math
@@ -204,6 +204,21 @@ class EventLikeData(CamelModel):
 class EventLikeResponse(CamelModel):
     success: bool
     data: EventLikeData
+
+
+class EventTranslationRequest(CamelModel):
+    model_config = ConfigDict(extra="forbid")
+    target_language: Literal["en", "fr"]
+
+
+class EventTranslationData(CamelModel):
+    target_language: Literal["en", "fr"]
+    description: str = Field(min_length=1)
+
+
+class EventTranslationResponse(CamelModel):
+    success: bool
+    data: EventTranslationData
 
 # --- ANNOUNCEMENTS ---
 

@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, joinedload, contains_eager
 from sqlalchemy import select, asc, desc, or_, insert, func
 import math
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 from datetime import datetime
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -30,11 +30,16 @@ from slowapi.errors import RateLimitExceeded
 
 from data import club_data, event_data
 import database, models, schemas, utils, storage
+from translations import get_event_translation
 from ratelimit import client_ip
 from post_sources import source_details
 from newsletter import unsubscribe_by_token
 
 models.Base.metadata.create_all(bind=database.engine)
+
+import metrics_tracking
+metrics_tracking.initialize(database.engine)
+metrics_tracking.install()
 
 load_dotenv()
 
@@ -129,6 +134,10 @@ def require_admin(current_user: models.User = Depends(utils.get_current_user)) -
     if current_user.role != models.UserRole.ADMIN.value:
         raise HTTPException(status_code=403, detail="Admin only")
     return current_user
+
+
+from admin_metrics import build_router as build_metrics_router
+api.include_router(build_metrics_router(require_admin, verify_api_key))
 
 
 # helper
@@ -364,6 +373,110 @@ async def browse_events(
     except Exception as e:
         logger.info(f"Error in browse_events: {e}")
         db.rollback()
+        raise HTTPException(500, detail="Internal server error")
+
+
+@api.middleware("http")
+async def prevent_private_endpoint_caching(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.rstrip("/") in {"/events/liked", "/admin/metrics"}:
+        response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@api.get("/events/liked", response_model=schemas.MultiEventResponse)
+async def liked_events(
+    request: Request,
+    search: Optional[str] = None,
+    tag: Optional[str] = None,
+    location_type: Optional[Literal["on-campus", "off-campus"]] = None,
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    club_id: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(12, ge=1, le=100),
+    sort_order: Literal["desc"] = Query("desc"),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    visitor_id = get_visitor_id(request)
+    try:
+        if not visitor_id:
+            raise ValueError("Missing visitor ID")
+        uuid.UUID(visitor_id)
+    except ValueError:
+        raise HTTPException(400, detail="Valid Visitor ID required")
+
+    try:
+        start_date = dt.date.fromisoformat(date_from) if date_from else None
+        end_date = dt.date.fromisoformat(date_to) if date_to else None
+    except ValueError:
+        raise HTTPException(422, detail="Dates must be valid YYYY-MM-DD values")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(422, detail="date_from must not be after date_to")
+
+    try:
+        # EXISTS keeps each event unique and uses the same rows as the like toggle.
+        query = select(models.Event).where(
+            models.Event.event_likes.any(models.EventLike.visitor_id == visitor_id)
+        )
+        if search:
+            query = query.where(or_(
+                models.Event.title.ilike(f"%{search}%"),
+                models.Event.description.ilike(f"%{search}%"),
+            ))
+        if tag:
+            query = query.where(models.Event.tags.ilike(f"%{tag}%"))
+        if location_type:
+            query = query.where(models.Event.location_type == location_type)
+        if club_id:
+            query = query.where(models.Event.club_id == club_id)
+        if start_date:
+            query = query.where(models.Event.date >= start_date)
+        if end_date:
+            query = query.where(models.Event.date <= end_date)
+
+        total = db.execute(select(func.count()).select_from(query.subquery())).scalar_one()
+        events = db.execute(
+            query.options(joinedload(models.Event.owner))
+            .order_by(models.Event.date.desc(), models.Event.start_time.desc(), models.Event.id.desc())
+            .offset((page - 1) * page_size).limit(page_size)
+        ).scalars().unique().all()
+        return schemas.MultiEventResponse(
+            success=True,
+            data=[map_event_to_response(event, has_liked=True) for event in events],
+            pagination=paginate(page, page_size, total),
+        )
+    except Exception:
+        logger.exception("Error in liked_events")
+        db.rollback()
+        raise HTTPException(500, detail="Internal server error")
+
+
+@api.post("/events/{event_id}/translation", response_model=schemas.EventTranslationResponse)
+def handle_event_translation(
+    event_id: str,
+    payload: schemas.EventTranslationRequest,
+    response: Response,
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    # Sync handlers run in FastAPI's thread pool; Azure cannot block the event loop.
+    response.headers["Cache-Control"] = "private, no-store"
+    try:
+        description = get_event_translation(db, event_id, payload.target_language)
+        return schemas.EventTranslationResponse(
+            success=True,
+            data=schemas.EventTranslationData(
+                target_language=payload.target_language, description=description,
+            ),
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception("Error in event translation")
         raise HTTPException(500, detail="Internal server error")
 
 
