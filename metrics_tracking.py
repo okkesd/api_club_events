@@ -20,6 +20,7 @@ def email_hash(email):
 
 def initialize(engine):
     with engine.begin() as connection:
+        insert_once(connection, m.MetricCoverage.__table__, {"name": "site_visitors", "started_at": dt.datetime.utcnow()})
         if insert_once(connection, m.MetricCoverage.__table__, {"name": "history", "started_at": dt.datetime.utcnow()}):
             # Do not misreport old subscribers' reactivations as new subscriptions.
             for email in connection.execute(select(m.Subscription.email)).scalars():

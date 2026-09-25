@@ -91,6 +91,7 @@ def calculate(db, days=7, now=None):
         "generatedAt": now.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "metrics": {key: {"current": current[key], "previous": before[key]} for key in METRICS},
         "totals": {
+            "uniqueSiteVisitors": count(db, m.SiteVisitor),
             "activeSubscribers": db.scalar(select(func.count(func.distinct(func.lower(func.trim(m.Subscription.email)))))
                 .where(m.Subscription.is_active.is_(True))),
             "pendingClubs": count(db, m.User, m.User.role == m.UserRole.CLUB, m.User.is_verified.is_(False)),
@@ -98,6 +99,11 @@ def calculate(db, days=7, now=None):
             "pendingScrapedEvents": count(db, m.ScrapedEvent, m.ScrapedEvent.status == m.ScrapedEventStatus.PENDING,
                                           m.ScrapedEvent.source == "instagram", m.ScrapedEvent.kind == "event"),
         },
+        "siteVisitorsTrackingStartedAt": (
+            started.replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            if (started := db.scalar(select(m.MetricCoverage.started_at).where(m.MetricCoverage.name == "site_visitors")))
+            else None
+        ),
         "daily": daily, "topEvents": top if top is not None else [],
     }
 
