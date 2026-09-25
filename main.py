@@ -138,6 +138,8 @@ def require_admin(current_user: models.User = Depends(utils.get_current_user)) -
 
 from admin_metrics import build_router as build_metrics_router
 api.include_router(build_metrics_router(require_admin, verify_api_key))
+from site_metrics import build_router as build_site_metrics_router
+api.include_router(build_site_metrics_router(verify_api_key))
 
 
 # helper

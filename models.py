@@ -388,6 +388,13 @@ class Suggestion(Base):
     created_announcement_id = Column(String, ForeignKey("announcements.id", ondelete="SET NULL"), unique=True)
 
 
+class SiteVisitor(Base):
+    """One row per browser that has opened any site page since tracking began."""
+    __tablename__ = "site_visitors"
+    visitor_id = Column(String(36), primary_key=True)
+    first_seen_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+
+
 class MetricRecord(Base):
     """Append-only history, deliberately independent of deletable content rows."""
     __tablename__ = "metric_records"
