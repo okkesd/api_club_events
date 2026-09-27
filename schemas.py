@@ -3,6 +3,7 @@ from typing import Optional, List, Literal
 import datetime
 import re
 import math
+from event_categories import EventCategory
 
 # --- BASE CONFIG ---
 class CamelModel(BaseModel):
@@ -84,6 +85,7 @@ class ClubBase(CamelModel):
     # socials: Optional[dict] = None
 
 class ClubUpdate(CamelModel):
+    category: Optional[EventCategory] = None
     club_name: Optional[str] = None
     # Instagram handle used to auto-match scraped events to this club (admin only)
     ig_username: Optional[str] = None
@@ -97,6 +99,7 @@ class ClubStatusUpdate(CamelModel):
     rejection_reason: Optional[str] = None
 
 class ClubResponse(ClubBase):
+    category: Optional[EventCategory] = None
     id: str
     role: str
     is_verified: bool
@@ -112,7 +115,19 @@ class AllClubsResponse(ApiResponse):
 
 # --- EVENTS ---
 
-class EventBase(CamelModel):
+class EventOrganizer(CamelModel):
+    organizer_instagram: Optional[str] = None
+
+    @field_validator("organizer_instagram")
+    @classmethod
+    def normalize_organizer_instagram(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value.strip().lstrip("@").strip() or None
+
+
+class EventBase(EventOrganizer):
+    category: Optional[EventCategory] = None
     title: str = Field(..., max_length=200)
     description: str = Field(..., max_length=5000)
     date: datetime.date
@@ -153,9 +168,10 @@ class EventBase(CamelModel):
 
 
 class EventCreate(EventBase):
-    club_id: str
+    club_id: Optional[str] = None
 
-class EventUpdate(CamelModel):
+class EventUpdate(EventOrganizer):
+    category: Optional[EventCategory] = None
     title: Optional[str] = Field(None, max_length=200)
     description: Optional[str] = Field(None, max_length=5000)
     date: Optional[datetime.date] = None
@@ -184,6 +200,7 @@ class EventUpdate(CamelModel):
         return v
 
 class EventResponse(EventBase):
+    category_override: Optional[EventCategory] = None
     source_post_url: Optional[str] = None
     id: str
     club_id: str
@@ -314,7 +331,7 @@ class ClubSubscriptionToggleResponse(CamelModel):
     is_subscribed: bool
 # --- SCRAPED EVENTS (admin approval inbox) ---
 
-class ScrapedEventResponse(CamelModel):
+class ScrapedEventResponse(EventOrganizer):
     id: str
     source: str
     source_event_id: str
@@ -363,7 +380,7 @@ class MultiScrapedEventResponse(ApiResponse):
     pagination: Optional[PaginationMeta] = None
 
 
-class ScrapedEventUpdate(CamelModel):
+class ScrapedEventUpdate(EventOrganizer):
     """Admin fixes to the extracted content before approving."""
     kind: Optional[str] = None
     title: Optional[str] = Field(None, max_length=200)
@@ -395,7 +412,8 @@ class MultiIgClubMappingResponse(ApiResponse):
     data: List[IgClubMappingResponse]
 
 
-class ScrapedEventApprove(CamelModel):
+class ScrapedEventApprove(EventOrganizer):
+    category: Optional[EventCategory] = None
     """Everything the real Event needs that the extractor cannot know.
 
     Anything left out falls back to the extracted value (or a sane default:

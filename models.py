@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, Boolean, ForeignKey, Float, Text, Date, Integer, DateTime, UniqueConstraint, Index
 from sqlalchemy import Enum as SQLEnum
-from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.orm import relationship, Mapped, mapped_column, foreign
+from sqlalchemy import func
 from database import Base
 from typing import Optional
 import datetime
@@ -36,6 +37,12 @@ def generate_slug(text: str) -> str:
     text = re.sub(r'\s+', '-', text)
     return text
 
+class OrganizerCategory(Base):
+    __tablename__ = "organizer_categories"
+    username: Mapped[str] = mapped_column(String(30), primary_key=True)
+    category: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -44,10 +51,15 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String)
     
     # Profile
+    category: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     club_name: Mapped[str] = mapped_column(String, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=True)
     logo_url: Mapped[str] = mapped_column(String, nullable=True)
     banner_url: Mapped[str] = mapped_column(String, nullable=True)
+
+    organizer_profile = relationship("OrganizerCategory",
+        primaryjoin=lambda: foreign(func.lower(User.ig_username)) == OrganizerCategory.username,
+        viewonly=True, uselist=False, lazy="selectin")
 
     # Status / Access Control
     role: Mapped[str] = mapped_column(
@@ -72,6 +84,11 @@ class Event(Base):
     
     # Content
     title: Mapped[str] = mapped_column(String, index=True)
+    category: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    organizer_instagram: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    organizer_profile = relationship("OrganizerCategory",
+        primaryjoin=lambda: foreign(func.lower(Event.organizer_instagram)) == OrganizerCategory.username,
+        viewonly=True, uselist=False, lazy="selectin")
     description: Mapped[str] = mapped_column(Text)
     cover_image: Mapped[str] = mapped_column(String, nullable=True)
     tags: Mapped[str] = mapped_column(String, default="") # Stored as comma-separated or JSON string usually
@@ -105,6 +122,23 @@ class Event(Base):
     # Relationships
     event_likes = relationship("EventLike", back_populates="event", cascade="all, delete-orphan")
     translations = relationship("EventTranslation", back_populates="event", cascade="all, delete-orphan")
+    reminders = relationship("EventReminder", back_populates="event", cascade="all, delete-orphan")
+
+
+class EventReminder(Base):
+    __tablename__ = "event_reminders"
+    __table_args__ = (UniqueConstraint("event_id", "email", name="uq_event_reminder_email"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    event_id: Mapped[str] = mapped_column(String, ForeignKey("events.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(320))
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    attempted_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+    sent_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    event = relationship("Event", back_populates="reminders")
 
 
 class EventTranslation(Base):
@@ -300,6 +334,8 @@ class ScrapedEvent(Base):
 
     # What this candidate becomes when approved: an Event or an Announcement.
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="event", index=True)
+
+    organizer_instagram: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Extracted content (editable by the admin before approval)
     title: Mapped[Optional[str]] = mapped_column(String, nullable=True)

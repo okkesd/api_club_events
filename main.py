@@ -36,6 +36,8 @@ from post_sources import source_details
 from newsletter import unsubscribe_by_token
 
 models.Base.metadata.create_all(bind=database.engine)
+from migrate_event_categories import migrate as migrate_categories
+migrate_categories(database.engine)
 
 import metrics_tracking
 metrics_tracking.initialize(database.engine)
@@ -88,7 +90,8 @@ api.add_middleware(
 # "the form won't save" reports impossible to diagnose. Log the offending fields and body.
 @api.exception_handler(RequestValidationError)
 async def log_validation_error(request: Request, exc: RequestValidationError):
-    if request.url.path == "/suggestions" or request.url.path.startswith("/admin/suggestions"):
+    if (request.url.path == "/suggestions" or request.url.path.startswith("/admin/suggestions")
+            or request.url.path.endswith("/reminders")):
         errors = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
     fields = [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
@@ -140,6 +143,10 @@ from admin_metrics import build_router as build_metrics_router
 api.include_router(build_metrics_router(require_admin, verify_api_key))
 from site_metrics import build_router as build_site_metrics_router
 api.include_router(build_site_metrics_router(verify_api_key))
+from event_highlights import build_router as build_highlights_router
+api.include_router(build_highlights_router(verify_api_key))
+from reminders import build_router as build_reminders_router
+api.include_router(build_reminders_router(verify_api_key, limiter, require_admin))
 
 
 # helper
@@ -186,6 +193,9 @@ def map_event_to_response(event: models.Event, has_liked: bool = False) -> schem
         club_id=str(event.club_id),
         club_name=event.owner.club_name if event.owner else "Unknown",
         title=event.title,
+        organizer_instagram=event.organizer_instagram,
+        category=effective_category(event),
+        category_override=event.category,
         description=description,
         date=event.date,
         start_time=event.start_time,
@@ -217,6 +227,7 @@ def map_club_to_response(club: models.User) -> schemas.ClubResponse:
             role=str(club.role),
             rejection_reason=str(club.rejection_reason),
             ig_username=club.ig_username,
+            category=club.category,
         )
 
 
@@ -759,9 +770,12 @@ async def create_event(
         raise HTTPException(status_code=403, detail="Posting event is not allowed for the user")
     
     if current_user.role == "club":
-        if (current_user.id != event_in.club_id):
+        if event_in.club_id is not None and (current_user.id != event_in.club_id):
             raise HTTPException(status_code=403, detail="You cannot post events for other clubs")
 
+
+    if event_in.club_id is None:
+        event_in.club_id = current_user.id
 
     # 1. Fetch the Club trying to post
     # (In a real app, this comes from the JWT Token. Here we look up the ID sent in the body)
@@ -771,7 +785,7 @@ async def create_event(
         raise HTTPException(status_code=404, detail="Club not found")
 
     # 2. ✅ CHECK: Block Event Creation if Unverified
-    if not bool(club.is_verified) and str(club.role) != "admin":
+    if not bool(club.is_verified) and club.role != models.UserRole.ADMIN:
         raise HTTPException(
             status_code=403, 
             detail="Your club is not verified yet. You cannot post events. Unverified"
@@ -791,6 +805,8 @@ async def create_event(
     db_event = models.Event(
         slug=slug,
         title=event_in.title,
+        organizer_instagram=event_in.organizer_instagram,
+        category=event_in.category,
         description=event_in.description,
         club_id=event_in.club_id,
         date=event_in.date, # Convert Str -> Date
@@ -873,7 +889,7 @@ async def update_club(
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
     
-    if not bool(club.is_verified) and str(club.role) != "admin":
+    if not bool(club.is_verified) and current_user.role != models.UserRole.ADMIN:
         raise HTTPException(
             status_code=403, 
             detail="Unverified clubs cannot edit their public profile. Contact admin."
@@ -898,6 +914,10 @@ async def update_club(
 
     # Controls which scraped Instagram events attach to this club — admin decides.
     # Unlike the fields above, an explicit null here *clears* the handle (omit it to leave it alone).
+    if "category" in club_update.model_fields_set:
+        if current_user.role != models.UserRole.ADMIN:
+            raise HTTPException(403, "Only admins can change club categories")
+        club.category = club_update.category
     if "ig_username" in club_update.model_fields_set:
         if current_user.role != models.UserRole.ADMIN.value:
             raise HTTPException(status_code=403, detail="Only an admin can set the Instagram username")
@@ -1050,6 +1070,10 @@ async def update_event(
     # Only update what is sent (Pydantic models exclude_unset=True is handled manually here for safety)
     
     if event_update.title is not None: db_event.title = event_update.title
+    if "category" in event_update.model_fields_set:
+        db_event.category = event_update.category
+    if "organizer_instagram" in event_update.model_fields_set:
+        db_event.organizer_instagram = event_update.organizer_instagram
     if event_update.description is not None: db_event.description = event_update.description
     if event_update.location is not None: db_event.location = event_update.location
     if event_update.location_type is not None: db_event.location_type = event_update.location_type
@@ -1589,7 +1613,7 @@ async def create_announcement(
     if not club:
         raise HTTPException(404, detail="Club not found")
 
-    if not bool(club.is_verified) and str(club.role) != "admin":
+    if not bool(club.is_verified) and club.role != models.UserRole.ADMIN:
         raise HTTPException(403, detail="Unverified clubs cannot post announcements")
 
     slug = models.generate_slug(f"{announcement_in.title} {datetime.now().strftime('%Y%m%d%H%M')}")
@@ -1845,6 +1869,7 @@ def map_scraped_to_response(
         post_image_url=row.post_image_url,
         posted_at=row.posted_at,
         title=row.title,
+        organizer_instagram=row.organizer_instagram,
         date=row.date,
         location=row.location,
         description=row.description,
@@ -2188,6 +2213,10 @@ async def approve_scraped_event(
     db_event = models.Event(
         slug=_unique_slug(db, f"{title} {event_date}"),
         title=title,
+        category=payload.category,
+        organizer_instagram=(payload.organizer_instagram
+                             if "organizer_instagram" in payload.model_fields_set
+                             else row.organizer_instagram),
         description=payload.description or row.description or "",
         club_id=club.id,
         date=event_date,
@@ -2429,3 +2458,7 @@ async def delete_ig_club_mapping(
 from suggestions import build_router as build_suggestions_router, SuggestionBodyLimit
 api.add_middleware(SuggestionBodyLimit)
 api.include_router(build_suggestions_router(require_admin, limiter, revalidate_frontend))
+
+
+from event_categories import build_router as build_categories_router, effective_category
+api.include_router(build_categories_router(require_admin, verify_api_key, revalidate_frontend))
