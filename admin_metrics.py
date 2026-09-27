@@ -34,10 +34,11 @@ def period_data(db, first, end, coverage):
     result["scheduledEvents"] = count(db, m.Event, m.Event.date >= first, m.Event.date < end)
     dates = [first + dt.timedelta(days=i) for i in range((end - first).days)]
     daily = [{"date": day.isoformat(), **dict.fromkeys(DAILY)} for day in dates]
-    if coverage is None or coverage > start_utc:
-        # Partial history is not a measured zero, even on individually covered days.
+    if coverage is None or coverage >= end_utc:
+        # No tracked portion exists within this period.
         return result, daily, None
 
+    start_utc = max(start_utc, coverage)
     r = m.MetricRecord
     bounds = (r.occurred_at >= start_utc, r.occurred_at < end_utc)
     grouped = dict(db.execute(select(r.kind, func.count()).where(*bounds).group_by(r.kind)).all())
@@ -67,7 +68,8 @@ def period_data(db, first, end, coverage):
             rows = db.execute(select(day, func.count()).where(*bounds, r.kind == kind).group_by(day))
         values = dict(rows.all())
         for row in daily:
-            row[kind] = values.get(row["date"], 0)
+            day_end = midnight(dt.date.fromisoformat(row["date"]) + dt.timedelta(days=1))
+            row[kind] = values.get(row["date"], 0) if coverage < day_end else None
 
     views = select(r.event_id, func.count().label("views")).where(*bounds, r.kind == "eventViews").group_by(r.event_id).subquery()
     like_counts = select(likes.c.event_id, func.count().label("likes")).group_by(likes.c.event_id).subquery()
@@ -88,6 +90,11 @@ def calculate(db, days=7, now=None):
         "period": {"from": first.isoformat(), "to": (end - dt.timedelta(days=1)).isoformat(),
                    "previousFrom": previous.isoformat(), "previousTo": (first - dt.timedelta(days=1)).isoformat(),
                    "timezone": "Europe/Istanbul"},
+        "historyCoverage": {
+            "startedAt": coverage.replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z") if coverage else None,
+            "currentComplete": coverage is not None and coverage <= midnight(first),
+            "previousComplete": coverage is not None and coverage <= midnight(previous),
+        },
         "generatedAt": now.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "metrics": {key: {"current": current[key], "previous": before[key]} for key in METRICS},
         "totals": {
