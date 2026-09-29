@@ -231,7 +231,7 @@ def map_club_to_response(club: models.User) -> schemas.ClubResponse:
         )
 
 
-# helper
+# helper 
 def paginate(page: int, page_size: int, total: Optional[int]) -> schemas.PaginationMeta:
     total = total or 0
     return schemas.PaginationMeta(
