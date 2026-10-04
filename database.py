@@ -19,10 +19,13 @@ if SQLALCHEMY_DATABASE_URL == "":
 # --- THE ENGINE ---
 # check_same_thread is needed only for SQLite
 if SQLALCHEMY_DATABASE_URL.startswith("postgresql"):
+    # Supabase session mode (port 5432) reserves a server connection for each
+    # open client connection, including idle connections kept by this pool.
+    # Budget these values across all app processes and scripts sharing the DB.
     engine = create_engine(
         SQLALCHEMY_DATABASE_URL,
-        pool_size=20,
-        max_overflow=10,
+        pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "0")),
         pool_pre_ping=True,
         pool_recycle=3600
     )
