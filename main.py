@@ -114,6 +114,8 @@ def get_week_range(ref_date_str: str) -> Tuple[datetime, datetime]:
     try:
         # Parse the input string "2026-01-18"
         dt = datetime.strptime(ref_date_str, "%Y-%m-%d")
+        if dt.strftime("%Y-%m-%d") != ref_date_str:
+            raise ValueError("Date must use YYYY-MM-DD")
         
         # Calculate Monday (0 = Monday, 6 = Sunday)
         start_of_week = dt - timedelta(days=dt.weekday())
@@ -122,7 +124,7 @@ def get_week_range(ref_date_str: str) -> Tuple[datetime, datetime]:
         end_of_week = start_of_week + timedelta(days=7)
         
         return start_of_week, end_of_week
-    except ValueError:
+    except (ValueError, OverflowError):
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
 # helper
@@ -252,7 +254,8 @@ async def health_check():
 async def weekly_events(
     request: Request,
     response: Response,
-    date: str = Query(..., description="Any date within the desired week (YYYY-MM-DD)"),
+    date: Optional[str] = Query(None, description="Legacy alias: any date within the desired week (YYYY-MM-DD)"),
+    week: Optional[str] = Query(None, description="Any date in the selected Monday–Sunday week (YYYY-MM-DD)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(database.get_db),
@@ -260,7 +263,11 @@ async def weekly_events(
 ):
 
     try:
-        week_beginning, week_end = get_week_range(date)
+        if week is None and date is None:
+            raise HTTPException(status_code=422, detail="Provide week (YYYY-MM-DD)")
+        week_beginning, week_end = get_week_range(week if week is not None else date)
+        if week is not None and date is not None and get_week_range(date)[0] != week_beginning:
+            raise HTTPException(status_code=400, detail="week and date must refer to the same week")
 
         base_filter = (
             select(models.Event)
@@ -274,7 +281,7 @@ async def weekly_events(
             base_filter
             .join(models.Event.owner)
             .options(contains_eager(models.Event.owner))
-            .order_by(models.Event.date.asc())
+            .order_by(models.Event.date.asc(), models.Event.start_time.asc(), models.Event.id.asc())
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
