@@ -1,6 +1,7 @@
 """Daily GSÜ import entry point, executed inside the running backend container."""
 import logging
 import os
+import traceback
 
 from sqlalchemy import select, func
 
@@ -16,12 +17,12 @@ log = logging.getLogger(__name__)
 def run(db):
     email = os.getenv("ADMIN_EMAIL", "").strip().lower()
     if not email:
-        raise ValueError("ADMIN_EMAIL must identify the school's internal admin owner")
+        raise gsu_import.GSUImportError("ADMIN_EMAIL is missing from the backend container")
     publisher = db.scalar(select(models.User).where(
         func.lower(models.User.email) == email,
         models.User.role == models.UserRole.ADMIN))
     if publisher is None:
-        raise ValueError("ADMIN_EMAIL does not match an existing admin account")
+        raise gsu_import.GSUImportError("ADMIN_EMAIL does not match an existing admin account in the configured database")
     log.info("GSÜ daily import started")
     stats = gsu_import.import_gsu_events(db, publisher, limit=20)
     pending = db.scalars(select(models.ScrapedEvent).where(
@@ -44,8 +45,15 @@ def main():
         with database.SessionLocal() as db:
             run(db)
     except Exception as exc:
-        # Do not expose connection strings or credentials through exception text.
-        log.error("GSÜ daily import failed (%s)", type(exc).__name__)
+        # Curated importer errors contain no credentials or raw response data.
+        if isinstance(exc, gsu_import.GSUImportError):
+            log.error("GSÜ daily import failed: %s", exc)
+        else:
+            # Show the failing code location, without arbitrary exception text,
+            # source lines or local variables that could contain credentials.
+            frame = traceback.extract_tb(exc.__traceback__)[-1]
+            log.error("GSÜ daily import failed (%s) at %s:%d (%s)",
+                type(exc).__name__, os.path.basename(frame.filename), frame.lineno, frame.name)
         return 1
     return 0
 
