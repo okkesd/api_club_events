@@ -57,7 +57,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          source: "docker-compose.yml,deploy/systemd,scripts/install-gsu-timer.sh"
+          source: "docker-compose.yml,deploy/systemd,scripts/install-gsu-timer.sh,scripts/install-cinema-timer.sh"
           target: "/home/${{ secrets.SSH_USER }}/docker-app"
 
       # 2. Restart the Backend Container
@@ -111,6 +111,8 @@ jobs:
             sudo -n bash scripts/install-gsu-timer.sh
             # First import after deployment runs asynchronously; logs go to journald.
             sudo -n systemctl start --no-block evenements-gsu-import.service
+            sudo -n bash scripts/install-cinema-timer.sh
+            sudo -n systemctl start --no-block evenements-cinema-import.service
             
             # Cleanup space
             docker image prune -f

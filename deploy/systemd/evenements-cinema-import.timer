@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Sinefil's Eye cinema import
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 Europe/Istanbul
+Persistent=true
+AccuracySec=1min
+Unit=evenements-cinema-import.service
+
+[Install]
+WantedBy=timers.target
