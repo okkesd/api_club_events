@@ -362,6 +362,8 @@ class ScrapedEventResponse(EventOrganizer):
     status: str
     rejection_reason: Optional[str] = None
     reviewed_at: Optional[datetime.datetime] = None
+    auto_approved: bool = False
+    auto_approved_at: Optional[datetime.datetime] = None
     club_id: Optional[str] = None
     club_name: Optional[str] = None
     # true when club_id came from a remembered handle mapping rather than a fresh guess
@@ -369,6 +371,42 @@ class ScrapedEventResponse(EventOrganizer):
     created_event_id: Optional[str] = None
     created_announcement_id: Optional[str] = None
     created_at: datetime.datetime
+
+
+class EventVerificationResponse(CamelModel):
+    id: str
+    scraped_event_id: str
+    fingerprint: str
+    status: str
+    probability: Optional[float] = None
+    confidence: Optional[float] = None
+    explanation: str
+    inconsistencies: List[str]
+    checks: dict
+    poster_verified: bool
+    eligible: bool
+    candidate_unchanged: bool
+    shadow_mode: bool
+    policy_version: str
+    requested_model: str
+    resolved_model: Optional[str] = None
+    threshold: float
+    error_code: Optional[str] = None
+    attempts: int
+    review_status_at_verification: str
+    current_review_status: str
+    manual_reviewed: bool
+    started_at: datetime.datetime
+    completed_at: Optional[datetime.datetime] = None
+    auto_published_at: Optional[datetime.datetime] = None
+
+
+class MultiEventVerificationResponse(ApiResponse):
+    data: List[EventVerificationResponse]
+
+
+class SingleEventVerificationResponse(ApiResponse):
+    data: Optional[EventVerificationResponse] = None
 
 
 class SingleScrapedEventResponse(ApiResponse):
