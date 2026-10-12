@@ -200,6 +200,7 @@ class EventUpdate(EventOrganizer):
         return v
 
 class EventResponse(EventBase):
+    organizer_name: Optional[str] = None
     category_override: Optional[EventCategory] = None
     source_post_url: Optional[str] = None
     id: str
@@ -349,6 +350,7 @@ class ScrapedEventResponse(EventOrganizer):
     # Extracted content
     title: Optional[str] = None
     date: Optional[datetime.datetime] = None
+    end_date: Optional[datetime.datetime] = None
     location: Optional[str] = None
     description: Optional[str] = None
     confidence: float

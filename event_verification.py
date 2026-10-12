@@ -87,9 +87,13 @@ def normalize_event_datetime(value, caption=None):
 
 def publication_values(row, payload, club_id):
     """The existing approval defaults, shared by manual approval and verification."""
-    event_datetime = normalize_event_datetime(row.date, row.post_caption)
+    event_datetime = (row.date if row.source == "gsu_website" else
+                      normalize_event_datetime(row.date, row.post_caption))
     start = payload.start_time or (event_datetime.strftime("%H:%M") if event_datetime else DEFAULT_START_TIME)
-    duration = payload.duration or DEFAULT_DURATION_HOURS
+    source_end = getattr(row, "end_date", None)
+    source_duration = ((source_end - row.date).total_seconds() / 3600
+                       if source_end and row.date and source_end > row.date else None)
+    duration = payload.duration or source_duration or DEFAULT_DURATION_HOURS
     return dict(
         title=payload.title or row.title,
         description=payload.description or row.description or "",
@@ -135,7 +139,7 @@ def snapshot(db, row):
             "title": row.title,
             "description": row.description,
             "start_datetime": row.date,
-            "end_datetime": None,  # Not stored by the existing extractor.
+            "end_datetime": getattr(row, "end_date", None),
             "location": row.location,
             "organizer_instagram": row.organizer_instagram,
             "category": row.category,
