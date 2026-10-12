@@ -34,10 +34,12 @@ import event_verification
 import scraped_auto_approval
 from translations import get_event_translation
 from ratelimit import client_ip
-from post_sources import source_details
+from post_sources import source_details, organizer_name, is_gsu_source, GSU_NAME
 from newsletter import unsubscribe_by_token
 
 models.Base.metadata.create_all(bind=database.engine)
+from migrate_scraped_end_date import migrate as migrate_scraped_end_date
+migrate_scraped_end_date(database.engine)
 from migrate_event_categories import migrate as migrate_categories
 migrate_categories(database.engine)
 
@@ -193,9 +195,10 @@ def map_event_to_response(event: models.Event, has_liked: bool = False) -> schem
     source_url, description = source_details(event.source_posts, event.description)
     return schemas.EventResponse(
         source_post_url=source_url,
+        organizer_name=organizer_name(event.source_posts),
         id=str(event.id),
         club_id=str(event.club_id),
-        club_name=event.owner.club_name if event.owner else "Unknown",
+        club_name=organizer_name(event.source_posts) or (event.owner.club_name if event.owner else "Unknown"),
         title=event.title,
         organizer_instagram=event.organizer_instagram,
         category=effective_category(event),
@@ -1878,6 +1881,7 @@ def map_scraped_to_response(
         title=row.title,
         organizer_instagram=row.organizer_instagram,
         date=row.date,
+        end_date=row.end_date,
         location=row.location,
         description=row.description,
         confidence=float(row.confidence or 0.0),
@@ -1890,7 +1894,7 @@ def map_scraped_to_response(
         auto_approved=_is_auto_approved(row),
         auto_approved_at=row.reviewed_at if _is_auto_approved(row) else None,
         club_id=row.club_id,
-        club_name=row.club.club_name if row.club else None,
+        club_name=GSU_NAME if is_gsu_source(row) else (row.club.club_name if row.club else None),
         club_is_remembered=club_is_remembered,
         created_event_id=row.created_event_id,
         created_announcement_id=row.created_announcement_id,
@@ -2043,6 +2047,24 @@ async def import_scraped_events(
     return schemas.ScrapedEventImportResponse(success=True, data=stats)
 
 
+@api.post("/admin/scraped-events/import-gsu", response_model=schemas.ScrapedEventImportResponse)
+@limiter.limit("2/minute")
+def import_gsu_scraped_events(
+    request: Request,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    from gsu_import import import_gsu_events
+    try:
+        stats = import_gsu_events(db, current_user)
+    except Exception as exc:
+        db.rollback()
+        logger.warning("GSÜ import failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Could not import GSÜ events; retry later")
+    return schemas.ScrapedEventImportResponse(success=True, data=stats)
+
+
 @api.get("/admin/scraped-events", response_model=schemas.MultiScrapedEventResponse)
 async def list_scraped_events(
     status: str = Query("pending"),
@@ -2143,7 +2165,7 @@ async def update_scraped_event(
         setattr(row, field, value)
 
     # Picking a club here teaches the mapping, so the next post from this handle arrives set.
-    if updates.get("club_id"):
+    if updates.get("club_id") and row.source == "instagram":
         remember_publisher(db, row.club_username, updates["club_id"])
 
     try:
@@ -2310,7 +2332,7 @@ def publish_scraped_event(db, scraped_id, payload, current_user, verification_id
         if verification or auto_approve_complete:
             # Include the verified source/content in the claim for databases that
             # cannot lock the staging row (SQLite). Concurrent edits invalidate it.
-            for field in ("kind", "title", "date", "location", "description", "club_id",
+            for field in ("kind", "title", "date", "end_date", "location", "description", "club_id",
                           "organizer_instagram", "source", "post_caption", "post_image_url",
                           "post_url", "posted_at", "club_username", "post_shortcode",
                           "category", "link", "expires_at"):
@@ -2331,7 +2353,8 @@ def publish_scraped_event(db, scraped_id, payload, current_user, verification_id
         db.flush()
 
         # Remember the choice — including "publish as admin" — for this handle's next post.
-        remember_publisher(db, row.club_username, club.id)
+        if row.source == "instagram":
+            remember_publisher(db, row.club_username, club.id)
 
         row.status = models.ScrapedEventStatus.APPROVED
         row.club_id = club.id

@@ -340,6 +340,7 @@ class ScrapedEvent(Base):
     # Extracted content (editable by the admin before approval)
     title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    end_date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
     location: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)

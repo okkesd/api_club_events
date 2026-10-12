@@ -1,0 +1,13 @@
+[Unit]
+Description=Import Galatasaray University events into Evenements
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker exec backend python -u -m gsu_job
+TimeoutStartSec=15min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=evenements-gsu-import

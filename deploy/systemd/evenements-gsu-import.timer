@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Galatasaray University event import
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Europe/Istanbul
+Persistent=true
+AccuracySec=1min
+Unit=evenements-gsu-import.service
+
+[Install]
+WantedBy=timers.target

@@ -57,7 +57,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          source: "docker-compose.yml"
+          source: "docker-compose.yml,deploy/systemd,scripts/install-gsu-timer.sh"
           target: "/home/${{ secrets.SSH_USER }}/docker-app"
 
       # 2. Restart the Backend Container
@@ -68,6 +68,7 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
+            set -eu
             cd /home/${{ secrets.SSH_USER }}/docker-app
 
             # Write .env from GitHub Secrets
@@ -93,6 +94,23 @@ jobs:
             
             # Restart only the backend service
             docker compose up -d backend
+
+            # Install the daily host timer after the new backend is healthy.
+            gsu_backend_ready=false
+            for gsu_attempt in $(seq 1 60); do
+              if [ "$(docker inspect --format '{{.State.Health.Status}}' backend)" = "healthy" ]; then
+                gsu_backend_ready=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "$gsu_backend_ready" != true ]; then
+              echo "Backend did not become healthy; GSÜ timer setup aborted" >&2
+              exit 1
+            fi
+            sudo -n bash scripts/install-gsu-timer.sh
+            # First import after deployment runs asynchronously; logs go to journald.
+            sudo -n systemctl start --no-block evenements-gsu-import.service
             
             # Cleanup space
             docker image prune -f
