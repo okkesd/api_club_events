@@ -24,10 +24,6 @@ FALLBACK_DESCRIPTION = "Okul etkinliğidir."
 log = logging.getLogger(__name__)
 
 
-class GSUImportError(ValueError):
-    """Curated diagnostic text that is safe to write to the server journal."""
-
-
 @dataclass
 class SchoolEvent:
     source_id: str
@@ -44,25 +40,22 @@ class SchoolEvent:
 def calendar_entries(html):
     match = re.search(r"\bconst\s+cdata\s*=\s*(\[.*?\])\s*;", html, re.S)
     if not match:
-        raise GSUImportError("GSÜ calendar structure changed")
-    try:
-        entries = json.loads(match.group(1))
-    except json.JSONDecodeError as exc:
-        raise GSUImportError("GSÜ calendar contains invalid JSON") from exc
+        raise ValueError("GSÜ calendar structure changed")
+    entries = json.loads(match.group(1))
     if not isinstance(entries, list):
-        raise GSUImportError("Invalid GSÜ calendar")
+        raise ValueError("Invalid GSÜ calendar")
     return entries
 
 
 def parse_detail(html, url):
     if not is_gsu_event_url(url):
-        raise GSUImportError("Invalid GSÜ event URL")
+        raise ValueError("Invalid GSÜ event URL")
     soup = BeautifulSoup(html, "html.parser")
     title = soup.select_one(".post-title")
     content = soup.select_one(".post-excerpt")
     info = soup.select_one(".bq-event-detail")
     if not title or not content or not info:
-        raise GSUImportError("GSÜ detail structure changed")
+        raise ValueError("GSÜ detail structure changed")
     values = {}
     for label in info.select("strong"):
         name = label.get_text(" ", strip=True).rstrip(":")
@@ -70,17 +63,14 @@ def parse_detail(html, url):
 
     def timestamp(name):
         value = values.get(name)
-        try:
-            return datetime.strptime(value, "%d.%m.%Y %H.%M") if value else None
-        except ValueError as exc:
-            raise GSUImportError("GSÜ detail datetime format is invalid") from exc
+        return datetime.strptime(value, "%d.%m.%Y %H.%M") if value else None
 
     start = timestamp("Başlangıç Tarihi ve Saati")
     end = timestamp("Bitiş Tarihi ve Saati")
     if not start or not title.get_text(strip=True):
-        raise GSUImportError("Missing GSÜ title or start datetime")
+        raise ValueError("Missing GSÜ title or start datetime")
     if end and end <= start:
-        raise GSUImportError("Invalid GSÜ end datetime")
+        raise ValueError("Invalid GSÜ end datetime")
 
     image_url = None
     for image in content.select("img"):
@@ -112,7 +102,7 @@ def fetch_html(session, url):
     response = session.get(url, timeout=15, allow_redirects=False)
     response.raise_for_status()
     if response.status_code != 200:
-        raise GSUImportError("Unexpected redirect from GSÜ")
+        raise ValueError("Unexpected redirect from GSÜ")
     response.encoding = "utf-8"
     return response.text
 
@@ -124,7 +114,7 @@ def import_gsu_events(db, publisher, limit=10, session=None, now=None):
     Instagram account is invented. Public presentation comes from source provenance.
     """
     if publisher.role != models.UserRole.ADMIN:
-        raise GSUImportError("School imports require an admin owner")
+        raise ValueError("School imports require an admin owner")
     now = now or datetime.now(ZoneInfo("Europe/Istanbul")).replace(tzinfo=None)
     limit = min(max(limit, 1), 20)
     imported = skipped = 0
@@ -140,10 +130,7 @@ def import_gsu_events(db, publisher, limit=10, session=None, now=None):
             url = urljoin(BASE, entry.get("url", ""))
             if not is_gsu_event_url(url):
                 continue
-            try:
-                start = datetime.fromisoformat(entry["start"])
-            except (ValueError, TypeError, KeyError) as exc:
-                raise GSUImportError("GSÜ calendar start datetime is missing or invalid") from exc
+            start = datetime.fromisoformat(entry["start"])
             if start.tzinfo:
                 start = start.astimezone(ZoneInfo("Europe/Istanbul")).replace(tzinfo=None)
             if start.date() >= now.date():
