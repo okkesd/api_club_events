@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 import datetime as dt
 from sqlalchemy.orm import Session, joinedload, contains_eager
-from sqlalchemy import select, asc, desc, or_, insert, func
+from sqlalchemy import select, asc, desc, or_, insert, func, update
 import math
 import time
 from typing import Dict, List, Literal, Optional, Tuple
@@ -30,6 +30,8 @@ from slowapi.errors import RateLimitExceeded
 
 from data import club_data, event_data
 import database, models, schemas, utils, storage
+import event_verification
+import scraped_auto_approval
 from translations import get_event_translation
 from ratelimit import client_ip
 from post_sources import source_details
@@ -1852,8 +1854,6 @@ if __name__ == "__main__":
 # What fills the staging table is external — see pipeline_import.py where installed.
 # ---------------------------------------------------------------------------
 
-DEFAULT_DURATION_HOURS = 2.0
-DEFAULT_LOCATION_TYPE = models.LocationType.ON_CAMPUS.value
 # Instagram CDN URLs are signed and expire within days, so a published event must never
 # point at one — the image is copied into our own storage at approval time.
 MAX_REHOST_BYTES = 15 * 1024 * 1024
@@ -1887,6 +1887,8 @@ def map_scraped_to_response(
         status=_status(row),
         rejection_reason=row.rejection_reason,
         reviewed_at=row.reviewed_at,
+        auto_approved=_is_auto_approved(row),
+        auto_approved_at=row.reviewed_at if _is_auto_approved(row) else None,
         club_id=row.club_id,
         club_name=row.club.club_name if row.club else None,
         club_is_remembered=club_is_remembered,
@@ -1914,15 +1916,16 @@ def _unique_announcement_slug(db: Session, base: str) -> str:
     return candidate
 
 
-def _add_hours(hhmm: str, hours: float) -> str:
-    h, m = map(int, hhmm.split(":"))
-    total = (h * 60 + m + int(round(hours * 60))) % (24 * 60)
-    return f"{total // 60:02d}:{total % 60:02d}"
-
-
 def _status(row: models.ScrapedEvent) -> str:
     """Status comes back as the enum member or a plain string depending on the driver."""
     return getattr(row.status, "value", row.status)
+
+
+def _is_auto_approved(row: models.ScrapedEvent) -> bool:
+    # Both automatic publishers retain the source row and leave reviewed_by empty.
+    # Manual approval always records the admin, including when publishing as a club.
+    return (row.kind == "event" and _status(row) == "approved"
+            and row.reviewed_by is None and row.reviewed_at is not None)
 
 
 def rehost_image(source_url: str, shortcode: str) -> Optional[str]:
@@ -2051,8 +2054,8 @@ async def list_scraped_events(
     db: Session = Depends(database.get_db),
     token: str = Depends(verify_api_key),
 ):
-    """Inbox listing. `status` accepts pending / approved / rejected / all."""
-    valid = {s.value for s in models.ScrapedEventStatus} | {"all"}
+    """Inbox and retained approval history, including automatic publications."""
+    valid = {s.value for s in models.ScrapedEventStatus} | {"all", "auto-approved"}
     if status not in valid:
         raise HTTPException(status_code=400, detail=f"status must be one of {sorted(valid)}")
 
@@ -2060,7 +2063,14 @@ async def list_scraped_events(
         raise HTTPException(status_code=400, detail='kind must be "event" or "announcement"')
 
     base_query = select(models.ScrapedEvent)
-    if status != "all":
+    if status == "auto-approved":
+        base_query = base_query.where(
+            models.ScrapedEvent.status == models.ScrapedEventStatus.APPROVED,
+            models.ScrapedEvent.kind == "event",
+            models.ScrapedEvent.reviewed_by.is_(None),
+            models.ScrapedEvent.reviewed_at.is_not(None),
+        )
+    elif status != "all":
         base_query = base_query.where(models.ScrapedEvent.status == status)
     if kind:
         base_query = base_query.where(models.ScrapedEvent.kind == kind)
@@ -2069,10 +2079,13 @@ async def list_scraped_events(
 
     try:
         total = db.execute(select(func.count()).select_from(base_query.subquery())).scalar()
+        ordering = (
+            [desc(models.ScrapedEvent.reviewed_at), desc(models.ScrapedEvent.id)]
+            if status == "auto-approved" else
+            [desc(models.ScrapedEvent.confidence), asc(models.ScrapedEvent.date)]
+        )
         query = (
-            base_query.order_by(
-                desc(models.ScrapedEvent.confidence), asc(models.ScrapedEvent.date)
-            )
+            base_query.order_by(*ordering)
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
@@ -2141,9 +2154,48 @@ async def update_scraped_event(
         logger.info("Exception occured in update scraped event: %s", e)
         raise HTTPException(status_code=500, detail="Could not update scraped event")
 
+    scraped_auto_approval.approve_complete_events(db, [row.id])
+    db.refresh(row)
     return schemas.SingleScrapedEventResponse(
         success=True, data=map_scraped_to_response(row, _has_mapping(db, row.club_username))
     )
+
+
+@api.get("/admin/scraped-events/{scraped_id}/verifications", response_model=schemas.MultiEventVerificationResponse)
+def list_event_verifications(
+    scraped_id: str,
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    row = _get_or_404(db, scraped_id)
+    records = db.scalars(select(models.ScrapedEventVerification).where(
+        models.ScrapedEventVerification.scraped_event_id == scraped_id).order_by(
+            models.ScrapedEventVerification.started_at.desc())).all()
+    return schemas.MultiEventVerificationResponse(success=True,
+        data=[event_verification.to_response(db, record, row) for record in records])
+
+
+@api.post("/admin/scraped-events/{scraped_id}/verify", response_model=schemas.SingleEventVerificationResponse)
+def verify_scraped_event(
+    scraped_id: str,
+    retry_errors: bool = Query(False),
+    current_user: models.User = Depends(require_admin),
+    db: Session = Depends(database.get_db),
+    token: str = Depends(verify_api_key),
+):
+    """Explicit replay always runs in shadow mode, including reviewed candidates."""
+    row = _get_or_404(db, scraped_id)
+    try:
+        settings = event_verification.Settings.from_env()
+    except ValueError:
+        raise HTTPException(status_code=503, detail="Jev verification configuration is invalid")
+    if not settings.enabled:
+        raise HTTPException(status_code=503, detail="Jev verification is disabled")
+    record = event_verification.verify_event(db, scraped_id, settings=settings,
+        force_shadow=True, historical=True, retry_errors=retry_errors)
+    return schemas.SingleEventVerificationResponse(success=True,
+        data=event_verification.to_response(db, record, row) if record else None)
 
 
 @api.post("/admin/scraped-events/{scraped_id}/approve", response_model=schemas.SingleEventResponse)
@@ -2156,9 +2208,38 @@ async def approve_scraped_event(
     token: str = Depends(verify_api_key),
 ):
     """Publish a staged event: creates the real Event and marks the staging row approved."""
-    row = _get_or_404(db, scraped_id)
-    if _status(row) == models.ScrapedEventStatus.APPROVED.value:
+    db_event = publish_scraped_event(db, scraped_id, payload, current_user)
+    bg_tasks.add_task(revalidate_frontend, ["events"])
+    return schemas.SingleEventResponse(success=True, data=map_event_to_response(db_event))
+
+
+def publish_scraped_event(db, scraped_id, payload, current_user, verification_id=None,
+                         auto_approve_complete=False):
+    """Shared publication transaction for manual approval and opt-in Jev approval."""
+    row = db.scalar(select(models.ScrapedEvent).where(
+        models.ScrapedEvent.id == scraped_id).with_for_update().execution_options(populate_existing=True))
+    if not row:
+        raise HTTPException(status_code=404, detail="Scraped event not found")
+    if _status(row) == models.ScrapedEventStatus.APPROVED.value or row.created_event_id or row.created_announcement_id:
         raise HTTPException(status_code=409, detail="Scraped event already approved")
+    verification = None
+    if verification_id:
+        settings = event_verification.Settings.from_env()
+        verification = db.get(models.ScrapedEventVerification, verification_id)
+        if (not settings.enabled or settings.shadow_mode or not verification
+                or verification.scraped_event_id != row.id or verification.shadow_mode
+                or verification.status != "VERIFIED" or not verification.eligible
+                or row.post_image_url or event_verification.automatic_errors(db, row)
+                or verification.fingerprint != event_verification.fingerprint(
+                    event_verification.snapshot(db, row), settings)):
+            raise HTTPException(status_code=409, detail="Candidate is not eligible for automatic approval")
+        if payload.model_fields_set:
+            raise HTTPException(status_code=409, detail="Automatic approval cannot override verified content")
+    elif auto_approve_complete:
+        if scraped_auto_approval.completeness_errors(db, row) or payload.model_fields_set:
+            raise HTTPException(status_code=409, detail="Scraped event is incomplete or ineligible")
+    elif current_user is None:
+        raise HTTPException(status_code=403, detail="Manual approval requires an admin")
     if row.kind == "announcement":
         raise HTTPException(
             status_code=400,
@@ -2181,25 +2262,20 @@ async def approve_scraped_event(
     if not club:
         raise HTTPException(status_code=404, detail="Club not found")
 
-    # Date: admin override wins, else the extracted timestamp.
-    event_date = payload.date or (row.date.date() if row.date else None)
+    values = event_verification.publication_values(row, payload, club.id)
+    event_date = values["date"]
     if not event_date:
         raise HTTPException(status_code=400, detail="No date on this event — set date before approving")
 
-    title = payload.title or row.title
+    title = values["title"]
     if not title:
         raise HTTPException(status_code=400, detail="No title on this event — set title before approving")
 
-    location = payload.location or row.location
+    location = values["location"]
     if not location:
         raise HTTPException(status_code=400, detail="No location on this event — set location before approving")
 
-    # Time: the extractor only knows a timestamp, so fall back to its time-of-day.
-    start_time = payload.start_time or (row.date.strftime("%H:%M") if row.date else "00:00")
-    duration = payload.duration or DEFAULT_DURATION_HOURS
-    end_time = payload.end_time or _add_hours(start_time, duration)
-
-    location_type = payload.location_type or DEFAULT_LOCATION_TYPE
+    location_type = values["location_type"]
     if location_type not in {t.value for t in models.LocationType}:
         raise HTTPException(status_code=400, detail="Invalid locationType")
 
@@ -2219,27 +2295,38 @@ async def approve_scraped_event(
 
     db_event = models.Event(
         slug=_unique_slug(db, f"{title} {event_date}"),
-        title=title,
-        category=payload.category,
-        organizer_instagram=(payload.organizer_instagram
-                             if "organizer_instagram" in payload.model_fields_set
-                             else row.organizer_instagram),
-        description=payload.description or row.description or "",
-        club_id=club.id,
-        date=event_date,
-        start_time=start_time,
-        end_time=end_time,
-        duration=duration,
-        location_type=location_type,
-        location=location,
         cover_image=cover_image,
-        tags=",".join(payload.tags) if payload.tags else "",
-        is_registration_open=payload.is_registration_open,
-        registration_link=payload.registration_link,
-        capacity=payload.capacity,
+        **values,
     )
 
     try:
+        # Atomic claim also protects SQLite, where FOR UPDATE has no effect.
+        conditions = [
+            models.ScrapedEvent.id == row.id,
+            models.ScrapedEvent.status == row.status,
+            models.ScrapedEvent.created_event_id.is_(None),
+            models.ScrapedEvent.created_announcement_id.is_(None),
+        ]
+        if verification or auto_approve_complete:
+            # Include the verified source/content in the claim for databases that
+            # cannot lock the staging row (SQLite). Concurrent edits invalidate it.
+            for field in ("kind", "title", "date", "location", "description", "club_id",
+                          "organizer_instagram", "source", "post_caption", "post_image_url",
+                          "post_url", "posted_at", "club_username", "post_shortcode",
+                          "category", "link", "expires_at"):
+                conditions.append(getattr(models.ScrapedEvent, field) == getattr(row, field))
+            if verification:
+                # Re-check Jev's stronger publisher policy in the same claim.
+                conditions.append(select(models.User.id).where(
+                    models.User.id == row.club_id, models.User.is_verified.is_(True),
+                    or_(models.User.rejection_reason.is_(None), models.User.rejection_reason == ""),
+                ).exists())
+            else:
+                conditions.append(select(models.User.id).where(models.User.id == row.club_id).exists())
+        claimed = db.execute(update(models.ScrapedEvent).where(*conditions).values(
+            status=models.ScrapedEventStatus.APPROVED))
+        if claimed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Candidate review state changed")
         db.add(db_event)
         db.flush()
 
@@ -2250,18 +2337,22 @@ async def approve_scraped_event(
         row.club_id = club.id
         row.created_event_id = db_event.id
         row.reviewed_at = dt.datetime.utcnow()
-        row.reviewed_by = current_user.id
+        row.reviewed_by = current_user.id if current_user else None
         row.rejection_reason = None
+        if verification:
+            verification.auto_published_at = dt.datetime.utcnow()
 
         db.commit()
         db.refresh(db_event)
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         logger.info("Exception occured in approve scraped event: %s", e)
         raise HTTPException(status_code=500, detail="Could not publish event")
 
-    bg_tasks.add_task(revalidate_frontend, ["events"])
-    return schemas.SingleEventResponse(success=True, data=map_event_to_response(db_event))
+    return db_event
 
 
 @api.post("/admin/scraped-events/{scraped_id}/approve-announcement",
@@ -2395,6 +2486,7 @@ async def delete_scraped_event(
     """Drop a staging row. The published event, if any, is left untouched."""
     row = _get_or_404(db, scraped_id)
     try:
+        db.query(models.ScrapedEventVerification).filter_by(scraped_event_id=row.id).delete()
         db.delete(row)
         db.commit()
     except Exception as e:

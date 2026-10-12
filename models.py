@@ -376,6 +376,41 @@ class ScrapedEvent(Base):
     created_announcement = relationship("Announcement", foreign_keys=[created_announcement_id])
 
 
+class ScrapedEventVerification(Base):
+    """Independent judgments; never overwrite extraction or manual review fields."""
+    __tablename__ = "scraped_event_verifications"
+    __table_args__ = (
+        UniqueConstraint("scraped_event_id", "fingerprint", name="uq_scraped_verification_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
+    scraped_event_id: Mapped[str] = mapped_column(
+        String, ForeignKey("scraped_events.id", ondelete="CASCADE"), index=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    policy_version: Mapped[str] = mapped_column(String(32))
+    requested_model: Mapped[str] = mapped_column(String)
+    resolved_model: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    threshold: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(16), default="RUNNING")
+    probability: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    explanation: Mapped[str] = mapped_column(Text, default="Verification in progress")
+    inconsistencies_json: Mapped[str] = mapped_column(Text, default="[]")
+    checks_json: Mapped[str] = mapped_column(Text, default="{}")
+    input_json: Mapped[str] = mapped_column(Text)
+    poster_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    eligible: Mapped[bool] = mapped_column(Boolean, default=False)
+    shadow_mode: Mapped[bool] = mapped_column(Boolean, default=True)
+    review_status_at_verification: Mapped[str] = mapped_column(String(16))
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    attempt_token: Mapped[str] = mapped_column(String)
+    started_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    completed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+    auto_published_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class IgClubMapping(Base):
     """Remembers which app user an Instagram handle publishes under.
 
