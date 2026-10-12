@@ -149,3 +149,45 @@ def test_api_week_boundaries_pagination_inactive_and_auth(db):
         assert len(result['data']) == 2 and 'startsAt' in result['data'][0]
         assert len(client.get('/sinefil/screenings?week=2026-10-14&page=2&page_size=2', headers=headers).json()['data']) == 1
         assert client.get('/sinefil/screenings?week=bad', headers=headers).status_code == 422
+
+
+def test_film_identity_is_stable_across_case_spacing_and_unicode():
+    assert cinema_api.film_id('  PARIS,  TEXAS ') == cinema_api.film_id('Paris, Texas')
+    assert cinema_api.film_id('Cafe\u0301') == cinema_api.film_id('Café')
+    assert cinema_api.film_id('Akira') != cinema_api.film_id('Paris, Texas')
+
+
+def test_film_page_combines_venues_dates_and_preserves_link_after_cancellation(db):
+    from dataclasses import replace
+    first = screening('morning')
+    later = screening('evening', NOW + timedelta(days=1, hours=8))
+    next_day = replace(screening('atlas', NOW + timedelta(days=2)), title=' PARIS,  TEXAS ')
+    other_film = replace(screening('other'), title='Akira')
+    job.sync_source(db, scraper.VENUES[0], [first, later, other_film], NOW)
+    job.sync_source(db, scraper.VENUES[1], [next_day], NOW)
+    cancelled = db.scalar(select(models.CinemaScreening).where(models.CinemaScreening.source_id == 'morning'))
+    cancelled.is_active = False
+    db.commit()
+    def verify(x_api_key: str = Header(None)):
+        if x_api_key != 'test':
+            raise HTTPException(403)
+    app = FastAPI()
+    app.include_router(cinema_api.router(verify))
+    app.dependency_overrides[database.get_db] = lambda: db
+    movie_id = cinema_api.film_id(first.title)
+    with TestClient(app) as client:
+        path = f'/sinefil/films/{movie_id}'
+        assert client.get(path).status_code == 403
+        headers = {'x-api-key': 'test'}
+        result = client.get(path, headers=headers).json()['data']
+        assert result['id'] == movie_id
+        assert len(result['screenings']) == 2
+        assert [row['venue'] for row in result['screenings']] == ['Beyoğlu Majestik Sinema', 'Atlas 1948']
+        assert all(row['filmId'] == movie_id for row in result['screenings'])
+        week = client.get('/sinefil/screenings?week=2026-10-12', headers=headers).json()['data']
+        assert len([row for row in week if row['filmId'] == movie_id]) == 2
+        assert client.get('/sinefil/films/missing', headers=headers).status_code == 404
+        job.sync_source(db, scraper.VENUES[0], [], NOW)
+        job.sync_source(db, scraper.VENUES[1], [], NOW)
+        result = client.get(path, headers=headers).json()['data']
+        assert result['id'] == movie_id and result['screenings'] == []
