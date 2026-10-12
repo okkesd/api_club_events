@@ -76,27 +76,6 @@ class User(Base):
     events = relationship("Event", back_populates="owner", cascade="all, delete-orphan")
     announcements = relationship("Announcement", back_populates="owner", cascade="all, delete-orphan")
 
-class CinemaScreening(Base):
-    """Independent cinema calendar: never enters campus feeds or newsletters."""
-    __tablename__ = "cinema_screenings"
-    __table_args__ = (UniqueConstraint("source", "source_id", name="uix_cinema_source"),)
-
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=generate_uuid)
-    source: Mapped[str] = mapped_column(String(40), index=True)
-    source_id: Mapped[str] = mapped_column(String(200))
-    title: Mapped[str] = mapped_column(String(200))
-    venue: Mapped[str] = mapped_column(String(200))
-    starts_at: Mapped[datetime.datetime] = mapped_column(DateTime, index=True)
-    ends_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
-    description: Mapped[str] = mapped_column(Text, default="")
-    image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    source_url: Mapped[str] = mapped_column(Text)
-    ticket_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    auditorium: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_seen_at: Mapped[datetime.datetime] = mapped_column(DateTime)
-
-
 class Event(Base):
     __tablename__ = "events"
 
