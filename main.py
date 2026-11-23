@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 import datetime as dt
 from sqlalchemy.orm import Session, joinedload, contains_eager
 from sqlalchemy import select, asc, desc, or_, insert, func, update
+from sqlalchemy.exc import IntegrityError
 import math
 import time
 from typing import Dict, List, Literal, Optional, Tuple
@@ -535,9 +536,16 @@ async def handle_events(event_id: str, request: Request, db: Session = Depends(d
                 )
             ).scalar()
             if not already_viewed:
-                db.add(models.EventView(event_id=event_id, visitor_id=visitor_id))
-                event.view_count += 1
-                db.commit()
+                # Savepoint: a concurrent first view by the same visitor hits the
+                # unique constraint; treat it as already viewed instead of a 500.
+                try:
+                    with db.begin_nested():
+                        db.add(models.EventView(event_id=event_id, visitor_id=visitor_id))
+                        # SQL-side increment; Python `+= 1` loses concurrent updates.
+                        event.view_count = models.Event.view_count + 1
+                    db.commit()
+                except IntegrityError:
+                    db.rollback()
 
             # Check if this visitor has liked the event
             has_liked = db.execute(
