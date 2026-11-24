@@ -42,7 +42,7 @@ class SchoolEvent:
 
 
 def calendar_entries(html):
-    match = re.search(r"\bconst\s+cdata\s*=\s*(\[.*?\])\s*;", html, re.S)
+    match = re.search(r"\bconst\s+(?:cdata|initialData)\s*=\s*(\[.*?\])\s*;", html, re.S)
     if not match:
         raise GSUImportError("GSÜ calendar structure changed")
     try:
